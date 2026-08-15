@@ -1,8 +1,8 @@
 //! Row and document write DTOs. The Redis plugin advertises
-//! `row_writer: false` and no document capability, so these types are
-//! part of the wire contract but are never produced or accepted by the
-//! session service in this atom; the Redis adapter constructs them later.
-#![allow(dead_code)]
+//! `row_writer: true` and serves `perk/v1/row_write` over the virtual
+//! `keys` table; document writes are not advertised, so the document
+//! request/response types below are part of the wire contract but are
+//! never produced or accepted.
 
 use serde::{Deserialize, Serialize};
 
@@ -76,6 +76,10 @@ pub struct DocumentPayload {
     pub data: String,
 }
 
+/// Document write RPCs are not advertised by this plugin
+/// (`write_capabilities.document` is absent), so these wire DTOs are
+/// never produced or accepted here.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DocumentWriteRequest {
     pub operation: String,
@@ -88,6 +92,7 @@ pub struct DocumentWriteRequest {
     pub document: Option<DocumentPayload>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DocumentWriteResponse {
     pub result: RowsAffected,

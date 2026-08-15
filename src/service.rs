@@ -21,6 +21,7 @@ use crate::dto::service::{
     ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, QueryResult, ReferencingForeignKeyInfo,
     SchemaObject,
 };
+use crate::dto::write::{RowValue, RowWriteRequest, RowWriteResponse, RowsAffected};
 use crate::protocol::ERR_CANCELED;
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ServiceError>> + Send + 'a>>;
@@ -70,9 +71,11 @@ impl ServiceError {
     }
 }
 
-/// The 20 mandatory session handlers plus the close hook. Every method
-/// observes cancellation through `cancel`; a canceled handler must return
-/// a `-32800` error. Handlers are `Send` and may run concurrently.
+/// The 20 mandatory session handlers, the optional row_write handler
+/// (advertised by `write_capabilities.row_writer`), and the close hook.
+/// Every method observes cancellation through `cancel`; a canceled handler
+/// must return a `-32800` error. Handlers are `Send` and may run
+/// concurrently.
 pub trait SessionService: Send + Sync {
     fn execute(
         &self,
@@ -174,6 +177,15 @@ pub trait SessionService: Send + Sync {
         request: BrowseTableRequest,
         cancel: CancellationToken,
     ) -> ServiceFuture<'static, QueryResult>;
+    /// Optional `perk/v1/row_write` handler: insert/update/delete one row
+    /// of a virtual table. Services that do not advertise
+    /// `write_capabilities.row_writer` may stub it; the transport never
+    /// routes to it then.
+    fn row_write(
+        &self,
+        request: RowWriteRequest,
+        cancel: CancellationToken,
+    ) -> ServiceFuture<'static, RowWriteResponse>;
     /// Close hook. The server removes the session before calling this, so
     /// a failing hook can never resurrect the session.
     fn close(&self);
@@ -282,6 +294,118 @@ async fn execute_statement(
             "unsupported statement: {statement}"
         ))),
     }
+}
+
+/// One cell of the memory double must be a plain string; every other
+/// Value kind is rejected, mirroring the Redis service's rules.
+fn memory_string_cell(cell: &RowValue) -> Result<String, ServiceError> {
+    if cell.value.kind != "string" {
+        return Err(ServiceError::new(format!(
+            "column {} must be a string value (got {} kind)",
+            cell.name, cell.value.kind
+        )));
+    }
+    cell.value.string.clone().ok_or_else(|| {
+        ServiceError::new(format!(
+            "column {}: string kind without a payload",
+            cell.name
+        ))
+    })
+}
+
+/// The primary-key identity of a memory-double row write: exactly one
+/// string `key` cell. An empty string is a valid key; only the rename
+/// destination is rejected as empty.
+fn memory_identity(cells: Option<&[RowValue]>) -> Result<String, ServiceError> {
+    let Some(cells) = cells else {
+        return Err(ServiceError::new("missing key fields"));
+    };
+    let mut found: Option<String> = None;
+    for cell in cells {
+        if cell.name != "key" {
+            return Err(ServiceError::new(format!(
+                "unknown key column: {}",
+                cell.name
+            )));
+        }
+        if found.is_some() {
+            return Err(ServiceError::new("duplicate key fields"));
+        }
+        found = Some(memory_string_cell(cell)?);
+    }
+    found.ok_or_else(|| ServiceError::new("missing key fields"))
+}
+
+/// The changed-column list of a memory-double update: optional `key`
+/// rename destination and `value`; at least one change is required.
+fn memory_update_fields(
+    cells: Option<&[RowValue]>,
+) -> Result<(Option<String>, Option<String>), ServiceError> {
+    let Some(cells) = cells else {
+        return Err(ServiceError::new("update requires a values payload"));
+    };
+    let mut rename_to: Option<String> = None;
+    let mut value: Option<String> = None;
+    for cell in cells {
+        match cell.name.as_str() {
+            "key" => {
+                if rename_to.is_some() {
+                    return Err(ServiceError::new("duplicate column: key"));
+                }
+                let dst = memory_string_cell(cell)?;
+                if dst.is_empty() {
+                    return Err(ServiceError::new("rename destination must not be empty"));
+                }
+                rename_to = Some(dst);
+            }
+            "value" => {
+                if value.is_some() {
+                    return Err(ServiceError::new("duplicate column: value"));
+                }
+                value = Some(memory_string_cell(cell)?);
+            }
+            other => {
+                return Err(ServiceError::new(format!("unknown column: {other}")));
+            }
+        }
+    }
+    if rename_to.is_none() && value.is_none() {
+        return Err(ServiceError::new(
+            "update requires at least one column change",
+        ));
+    }
+    Ok((rename_to, value))
+}
+
+/// The insert cells of a memory-double insert: required `key`, optional
+/// `value` (defaults to the empty string).
+fn memory_insert_fields(cells: Option<&[RowValue]>) -> Result<(String, String), ServiceError> {
+    let Some(cells) = cells else {
+        return Err(ServiceError::new("insert requires a values payload"));
+    };
+    let mut key: Option<String> = None;
+    let mut value: Option<String> = None;
+    for cell in cells {
+        match cell.name.as_str() {
+            "key" => {
+                if key.is_some() {
+                    return Err(ServiceError::new("duplicate column: key"));
+                }
+                key = Some(memory_string_cell(cell)?);
+            }
+            "value" => {
+                if value.is_some() {
+                    return Err(ServiceError::new("duplicate column: value"));
+                }
+                value = Some(memory_string_cell(cell)?);
+            }
+            other => {
+                return Err(ServiceError::new(format!("unknown column: {other}")));
+            }
+        }
+    }
+    let key = key.ok_or_else(|| ServiceError::new("insert requires a key column"))?;
+    Ok((key, value.unwrap_or_default()))
 }
 
 impl SessionService for MemoryService {
@@ -529,6 +653,74 @@ impl SessionService for MemoryService {
                 .map(|(k, v)| vec![Some(k.clone()), Some(v.clone())])
                 .collect();
             Ok(stub_result(&["key", "value"], page, 0))
+        })
+    }
+
+    fn row_write(
+        &self,
+        request: RowWriteRequest,
+        _cancel: CancellationToken,
+    ) -> ServiceFuture<'static, RowWriteResponse> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            if request.table != "kv" {
+                return Err(ServiceError::new(format!(
+                    "unknown table: {}",
+                    request.table
+                )));
+            }
+            let affected = match request.operation.as_str() {
+                "insert" => {
+                    let (key, value) = memory_insert_fields(request.values.as_deref())?;
+                    let mut lock = store.lock().unwrap();
+                    if lock.contains_key(&key) {
+                        return Err(ServiceError::new(format!("key already exists: {key}")));
+                    }
+                    lock.insert(key, value);
+                    1
+                }
+                "update" => {
+                    let identity = memory_identity(request.key.as_deref())?;
+                    let (rename_to, value) = memory_update_fields(request.values.as_deref())?;
+                    let mut lock = store.lock().unwrap();
+                    if !lock.contains_key(&identity) {
+                        return Err(ServiceError::new(format!("key not found: {identity}")));
+                    }
+                    let destination = match &rename_to {
+                        Some(dst) => {
+                            if *dst != identity && lock.contains_key(dst) {
+                                return Err(ServiceError::new(format!(
+                                    "destination key already exists: {dst}"
+                                )));
+                            }
+                            dst.clone()
+                        }
+                        None => identity.clone(),
+                    };
+                    // Move the row to its destination: a rename keeps the
+                    // old value, a value change replaces it, and a
+                    // same-name update removes and reinserts in place.
+                    let old_value = lock.remove(&identity);
+                    if let Some(stored) = value.or(old_value) {
+                        lock.insert(destination, stored);
+                    }
+                    1
+                }
+                "delete" => {
+                    let identity = memory_identity(request.key.as_deref())?;
+                    u64::from(store.lock().unwrap().remove(&identity).is_some())
+                }
+                other => {
+                    return Err(ServiceError::new(format!(
+                        "unsupported row_write operation: {other}"
+                    )));
+                }
+            };
+            Ok(RowWriteResponse {
+                result: RowsAffected {
+                    rows_affected: affected,
+                },
+            })
         })
     }
 

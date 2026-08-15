@@ -129,7 +129,7 @@ pub fn redis_capabilities() -> Capabilities {
             ],
         }),
         write_capabilities: WriteCapabilities {
-            row_writer: false,
+            row_writer: true,
             document: None,
         },
     }
@@ -300,7 +300,8 @@ impl Server {
             "perk/v1/build_target" => self.handle_build_target(params, id, sink),
             "perk/v1/open" => self.handle_open(params, id, sink).await,
             "perk/v1/close" => self.handle_close(params, id, sink).await,
-            "perk/v1/row_write" | "perk/v1/document_write" => {
+            "perk/v1/row_write" => self.spawn_session_method(method, params, id, sink).await,
+            "perk/v1/document_write" => {
                 sink.send(frame_bytes(&Response::error(
                     Some(id),
                     ERR_METHOD_NOT_FOUND,
@@ -551,10 +552,26 @@ async fn run_session_method(
         ForeignKeyChangeRequest, IndexChangeRequest, ReplaceForeignKeyRequest, ReplaceIndexRequest,
         StatementRequest, TableRequest,
     };
+    use crate::dto::write::RowWriteRequest;
     match method {
         "perk/v1/execute" => call!(StatementRequest, execute),
         "perk/v1/execute_read_only" => call!(StatementRequest, execute_read_only),
         "perk/v1/validate" => call!(StatementRequest, validate),
+        // row_write carries `{session_id, request}`; the handler params
+        // are the nested `request` object, not the whole params object.
+        "perk/v1/row_write" => {
+            let request: RowWriteRequest =
+                serde_json::from_value(rest.get("request").cloned().unwrap_or(Value::Null))
+                    .map_err(|e| {
+                        ServiceError::with_code(ERR_INVALID_PARAMS, format!("invalid params: {e}"))
+                    })?;
+            let mut fut = session.row_write(request, token.clone());
+            tokio::select! {
+                r = &mut fut => r,
+                _ = token.cancelled() => Err(ServiceError::canceled("request canceled")),
+            }
+            .map(|out| serde_json::to_value(out).expect("result serialization cannot fail"))
+        }
         "perk/v1/list_schema" => call!(EmptyRequest, list_schema),
         "perk/v1/table_info" => call!(TableRequest, table_info),
         "perk/v1/list_indexes" => call!(TableRequest, list_indexes),
@@ -687,7 +704,7 @@ mod tests {
     use tokio::time::{sleep, timeout};
 
     use super::*;
-    use crate::protocol::ERR_CANCELED;
+    use crate::protocol::{ERR_CANCELED, ERR_INTERNAL};
     use crate::service::MemoryFactory;
 
     /// In-memory output buffer implementing `AsyncWrite`. `take_line`
@@ -702,11 +719,9 @@ mod tests {
     impl SharedBuf {
         fn take_line(&self) -> Option<Vec<u8>> {
             let mut buf = self.buf.lock().unwrap();
-            if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                Some(buf.drain(..=pos).collect())
-            } else {
-                None
-            }
+            buf.iter()
+                .position(|&b| b == b'\n')
+                .map(|pos| buf.drain(..=pos).collect())
         }
 
         fn transcript(&self) -> Vec<u8> {
@@ -849,7 +864,7 @@ mod tests {
                             {"key": "database", "title": "Database", "kind": 0, "default": "0", "validate": 0}
                         ]
                     },
-                    "write_capabilities": {"row_writer": false}
+                    "write_capabilities": {"row_writer": true}
                 }
             }),
             "initialize result must match the contract exactly"
@@ -1152,6 +1167,96 @@ mod tests {
             response["result"],
             json!({"target": "redis:redis://db.example.com:6380/2", "ok": true})
         );
+        h.finish().await.expect("clean EOF exit");
+    }
+
+    #[tokio::test]
+    async fn row_write_routes_end_to_end_and_stays_capability_gated() {
+        let mut h = Harness::start().await;
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"perk/v1/initialize","params":{"protocol_version":1,"workbench_version":"x"}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(
+            response["result"]["capabilities"]["write_capabilities"]["row_writer"],
+            json!(true),
+            "row_writer must be advertised"
+        );
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"perk/v1/open","params":{"target":"t"}}"#)
+            .await;
+        h.response().await;
+
+        // Insert one row through the row_write RPC.
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"perk/v1/row_write","params":{"session_id":1,"request":{"operation":"insert","table":"kv","values":[{"name":"key","value":{"kind":"string","string":"k1"}},{"name":"value","value":{"kind":"string","string":"v1"}}]}}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["id"], json!(3));
+        assert_eq!(
+            response["result"],
+            json!({"result": {"rows_affected": 1}}),
+            "insert response: {response}"
+        );
+
+        // The inserted row is visible through execute.
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"perk/v1/execute","params":{"session_id":1,"statement":"GET k1"}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["result"]["rows"][0][1], json!("v1"));
+
+        // Update the value cell.
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"perk/v1/row_write","params":{"session_id":1,"request":{"operation":"update","table":"kv","key":[{"name":"key","value":{"kind":"string","string":"k1"}}],"values":[{"name":"value","value":{"kind":"string","string":"v2"}}]}}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["result"], json!({"result": {"rows_affected": 1}}));
+
+        // Rename through the key column: the old identity disappears.
+        h.send(r#"{"jsonrpc":"2.0","id":6,"method":"perk/v1/row_write","params":{"session_id":1,"request":{"operation":"update","table":"kv","key":[{"name":"key","value":{"kind":"string","string":"k1"}}],"values":[{"name":"key","value":{"kind":"string","string":"k2"}}]}}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["result"], json!({"result": {"rows_affected": 1}}));
+        h.send(r#"{"jsonrpc":"2.0","id":7,"method":"perk/v1/execute","params":{"session_id":1,"statement":"GET k1"}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["result"]["rows"], json!([]), "source gone");
+        h.send(r#"{"jsonrpc":"2.0","id":8,"method":"perk/v1/execute","params":{"session_id":1,"statement":"GET k2"}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["result"]["rows"][0][1], json!("v2"));
+
+        // Delete once (1 row) and again (0 rows: the actual DEL count).
+        h.send(r#"{"jsonrpc":"2.0","id":9,"method":"perk/v1/row_write","params":{"session_id":1,"request":{"operation":"delete","table":"kv","key":[{"name":"key","value":{"kind":"string","string":"k2"}}]}}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["result"], json!({"result": {"rows_affected": 1}}));
+        h.send(r#"{"jsonrpc":"2.0","id":10,"method":"perk/v1/row_write","params":{"session_id":1,"request":{"operation":"delete","table":"kv","key":[{"name":"key","value":{"kind":"string","string":"k2"}}]}}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["result"], json!({"result": {"rows_affected": 0}}));
+
+        // A semantically malformed payload is an operation error (not a
+        // -32602: the params decode fine), keeping the transport alive.
+        h.send(r#"{"jsonrpc":"2.0","id":11,"method":"perk/v1/row_write","params":{"session_id":1,"request":{"operation":"upsert","table":"kv"}}}"#)
+            .await;
+        let response = h.response().await;
+        assert_error(&response, ERR_INTERNAL);
+        assert!(
+            response["error"]["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("row_write") || m.contains("operation")),
+            "operation error message: {response}"
+        );
+
+        // Params that do not decode are -32602 like every other RPC.
+        h.send(r#"{"jsonrpc":"2.0","id":12,"method":"perk/v1/row_write","params":{"session_id":1,"request":42}}"#)
+            .await;
+        let response = h.response().await;
+        assert_error(&response, ERR_INVALID_PARAMS);
+
+        // document_write is not advertised, so it stays method-not-found.
+        h.send(r#"{"jsonrpc":"2.0","id":13,"method":"perk/v1/document_write","params":{"session_id":1,"request":{"operation":"read","collection":"kv"}}}"#)
+            .await;
+        let response = h.response().await;
+        assert_error(&response, ERR_METHOD_NOT_FOUND);
+
         h.finish().await.expect("clean EOF exit");
     }
 }

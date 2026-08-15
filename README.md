@@ -125,6 +125,39 @@ plugin's stdout carries only protocol frames.
 
 Quit with `Ctrl+C` (or `Ctrl+Q` → Quit when the SQL editor holds text).
 
+## Row writing
+
+The plugin advertises `write_capabilities.row_writer` and serves
+`perk/v1/row_write` over the virtual `keys` table (covered by
+`tests/redis_integration.rs`). One row is one key in the selected logical
+database; `rows_affected` reports the real count.
+
+- **Insert** — an explicit `key` plus a `value` creates a Redis string
+  with `SET ... NX`: an existing key is rejected and nothing is
+  overwritten. The optional `type` column accepts only `string` (blank
+  defaults to string); collection types are rejected. A missing `value`
+  inserts the empty string.
+- **Update** — the `value` column replaces the complete string with
+  `SET`, but only for an existing string whose full value fits the
+  workbench's 300-rune display cell (valid UTF-8, at most 300 Unicode
+  scalar values). Larger strings, non-UTF-8 blobs, and hash/list/set/zset
+  values are rejected before anything is written: a bounded preview can
+  never overwrite a value it did not fully show. Editing the `key`
+  column renames the existing key (`RENAME` semantics: empty or colliding
+  destinations are rejected; renaming to the same name is a successful
+  no-op). `type` is immutable. A combined rename + value change
+  validates first, then applies atomically in one Lua script — a
+  collision or concurrent change aborts the whole update with no partial
+  mutation.
+- **Delete** — `DEL` the identified key; `rows_affected` is the actual
+  0/1 deletion count.
+
+In the current host the row forms live on the Browse tab, which cannot
+open `keys` because of the schema-sidebar limitation below, so the TUI
+path for writes is still the SQL editor (`SET`/`DEL`/`RENAME`). The
+row-write RPC itself is exercised end-to-end by the integration tests;
+collection **value** editing is deliberately unsupported.
+
 ## Schema browsing
 
 The plugin's `perk/v1/list_schema` serves exactly one virtual table —

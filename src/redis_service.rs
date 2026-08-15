@@ -8,8 +8,9 @@
 //! execute/validate. Host-generated virtual-table SELECTs
 //! (`SELECT * FROM "keys" ...`) route to the keys browse instead of
 //! Redis. The virtual schema exposes one fixed `keys` table
-//! over the selected logical database; the service never advertises row
-//! or document writes.
+//! over the selected logical database; `perk/v1/row_write` inserts,
+//! updates, and deletes rows of that table (document writes are not
+//! advertised).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -30,6 +31,7 @@ use crate::dto::service::{
     ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, QueryResult, ReferencingForeignKeyInfo,
     SchemaObject,
 };
+use crate::dto::write::{RowValue, RowWriteRequest, RowWriteResponse, RowsAffected};
 use crate::service::{OpenFuture, ServiceError, ServiceFuture, SessionFactory, SessionService};
 
 /// Display rows are capped here; `truncated`/`has_more` report the cut.
@@ -215,6 +217,215 @@ fn is_read_only(verb: &str) -> bool {
     READ_ONLY_COMMANDS
         .iter()
         .any(|command| command.eq_ignore_ascii_case(verb))
+}
+
+// --- row writes ---------------------------------------------------------
+
+/// One parsed row-write request over the virtual `keys` table, fully
+/// validated against the fixed schema before any Redis I/O.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RowWrite {
+    /// `DEL` the identified key; reports DEL's actual 0/1 count.
+    Delete { key: String },
+    /// Optional rename (when `key` is among the changed columns) plus an
+    /// optional value replacement.
+    Update {
+        key: String,
+        rename_to: Option<String>,
+        value: Option<String>,
+    },
+    /// `SET key value NX` from an explicit insert form.
+    Insert { key: String, value: String },
+}
+
+/// Validates a row-write request against the fixed `keys` schema and
+/// normalizes it. Everything is checked here — operation string, table,
+/// column names, cell kinds, key presence and uniqueness — before any
+/// Redis I/O happens.
+fn parse_row_write(request: &RowWriteRequest) -> Result<RowWrite, ServiceError> {
+    if request.table != KEYS_TABLE {
+        return Err(ServiceError::new(format!(
+            "unknown table: {}",
+            request.table
+        )));
+    }
+    match request.operation.as_str() {
+        "delete" => {
+            if let Some(values) = &request.values
+                && !values.is_empty()
+            {
+                return Err(ServiceError::new("delete does not accept a values payload"));
+            }
+            Ok(RowWrite::Delete {
+                key: parse_identity(request.key.as_deref())?,
+            })
+        }
+        "update" => {
+            let key = parse_identity(request.key.as_deref())?;
+            let values = request
+                .values
+                .as_deref()
+                .ok_or_else(|| ServiceError::new("update requires a values payload"))?;
+            let (rename_to, value) = parse_update_values(values)?;
+            Ok(RowWrite::Update {
+                key,
+                rename_to,
+                value,
+            })
+        }
+        "insert" => {
+            if request.key.is_some() {
+                return Err(ServiceError::new("insert does not accept a key identity"));
+            }
+            let values = request
+                .values
+                .as_deref()
+                .ok_or_else(|| ServiceError::new("insert requires a values payload"))?;
+            let (key, value) = parse_insert_values(values)?;
+            Ok(RowWrite::Insert { key, value })
+        }
+        other => Err(ServiceError::new(format!(
+            "unsupported row_write operation: {other}"
+        ))),
+    }
+}
+
+/// The primary-key cell list: exactly one string `key` cell. An empty
+/// string is a valid Redis key identity; only the rename destination is
+/// rejected as empty.
+fn parse_identity(cells: Option<&[RowValue]>) -> Result<String, ServiceError> {
+    let Some(cells) = cells else {
+        return Err(ServiceError::new("missing key fields"));
+    };
+    let mut found: Option<String> = None;
+    for cell in cells {
+        if cell.name != "key" {
+            return Err(ServiceError::new(format!(
+                "unknown key column: {}",
+                cell.name
+            )));
+        }
+        if found.is_some() {
+            return Err(ServiceError::new("duplicate key fields"));
+        }
+        found = Some(require_string(cell)?);
+    }
+    found.ok_or_else(|| ServiceError::new("missing key fields"))
+}
+
+/// One cell payload must be a plain string; every other Value kind is
+/// rejected (typed, default, null, collections).
+fn require_string(cell: &RowValue) -> Result<String, ServiceError> {
+    if cell.value.kind != "string" {
+        return Err(ServiceError::new(format!(
+            "column {} must be a string value (got {} kind)",
+            cell.name, cell.value.kind
+        )));
+    }
+    match &cell.value.string {
+        Some(s) => Ok(s.clone()),
+        None => Err(ServiceError::new(format!(
+            "column {}: string kind without a payload",
+            cell.name
+        ))),
+    }
+}
+
+/// The changed-column list of an update: optional `key` (the rename
+/// destination) and `value` (the new string). `type` is immutable and any
+/// other column is unknown; at least one change is required.
+fn parse_update_values(
+    cells: &[RowValue],
+) -> Result<(Option<String>, Option<String>), ServiceError> {
+    let mut rename_to: Option<String> = None;
+    let mut value: Option<String> = None;
+    for cell in cells {
+        match cell.name.as_str() {
+            "key" => {
+                if rename_to.is_some() {
+                    return Err(ServiceError::new("duplicate column: key"));
+                }
+                let destination = require_string(cell)?;
+                if destination.is_empty() {
+                    return Err(ServiceError::new("rename destination must not be empty"));
+                }
+                rename_to = Some(destination);
+            }
+            "value" => {
+                if value.is_some() {
+                    return Err(ServiceError::new("duplicate column: value"));
+                }
+                value = Some(require_string(cell)?);
+            }
+            "type" => {
+                return Err(ServiceError::new("column type is immutable"));
+            }
+            other => {
+                return Err(ServiceError::new(format!("unknown column: {other}")));
+            }
+        }
+    }
+    if rename_to.is_none() && value.is_none() {
+        return Err(ServiceError::new(
+            "update requires at least one column change",
+        ));
+    }
+    Ok((rename_to, value))
+}
+
+/// The insert cells: required `key`, optional `type` (string, or blank
+/// which defaults to string) and `value` (defaults to the empty string).
+fn parse_insert_values(cells: &[RowValue]) -> Result<(String, String), ServiceError> {
+    let mut key: Option<String> = None;
+    let mut value: Option<String> = None;
+    let mut type_seen = false;
+    for cell in cells {
+        match cell.name.as_str() {
+            "key" => {
+                if key.is_some() {
+                    return Err(ServiceError::new("duplicate column: key"));
+                }
+                key = Some(require_string(cell)?);
+            }
+            "value" => {
+                if value.is_some() {
+                    return Err(ServiceError::new("duplicate column: value"));
+                }
+                value = Some(require_string(cell)?);
+            }
+            "type" => {
+                if type_seen {
+                    return Err(ServiceError::new("duplicate column: type"));
+                }
+                type_seen = true;
+                // Only an explicit string type is accepted: "string" or a
+                // blank string, which defaults to string. The host omits
+                // untouched insert fields, so a DEFAULT kind here is a
+                // malformed payload, rejected like every other non-string
+                // kind.
+                let type_ = match cell.value.kind.as_str() {
+                    "string" => cell.value.string.clone().ok_or_else(|| {
+                        ServiceError::new("column type: string kind without a payload")
+                    })?,
+                    other => {
+                        return Err(ServiceError::new(format!(
+                            "column type must be a string value (got {other} kind)"
+                        )));
+                    }
+                };
+                if !type_.is_empty() && type_ != "string" {
+                    return Err(ServiceError::new(format!(
+                        "cannot insert: type {type_} is not supported (only string)"
+                    )));
+                }
+            }
+            other => {
+                return Err(ServiceError::new(format!("unknown column: {other}")));
+            }
+        }
+    }
+    let key = key.ok_or_else(|| ServiceError::new("insert requires a key column"))?;
+    Ok((key, value.unwrap_or_default()))
 }
 
 // --- redis::Value reply conversion -------------------------------------
@@ -705,6 +916,140 @@ impl RedisService {
         }
         serde_json::to_string(&serde_json::Value::Object(obj)).ok()
     }
+
+    // --- row writes ----------------------------------------------------
+
+    /// `DEL` one key; the actual 0/1 deletion count is the rows affected.
+    async fn delete_row(&self, key: &str) -> Result<u64, ServiceError> {
+        let deleted: i64 = self.query(redis::cmd("DEL").arg(key)).await?;
+        Ok(deleted.max(0) as u64)
+    }
+
+    /// `SET key value NX`: creates the string only when the key is
+    /// absent, so an explicit insert can never overwrite anything.
+    async fn insert_row(&self, key: &str, value: &str) -> Result<u64, ServiceError> {
+        let reply = self
+            .query::<redis::Value>(redis::cmd("SET").arg(key).arg(value).arg("NX"))
+            .await?;
+        match reply {
+            redis::Value::Nil => Err(ServiceError::new(format!("key already exists: {key}"))),
+            _ => Ok(1),
+        }
+    }
+
+    /// Applies one validated update. Reads validate everything first —
+    /// source existence, string type, complete UTF-8 value, 300-rune
+    /// display fit, destination availability — then one Lua script
+    /// re-checks the invariants and performs rename + SET together, so a
+    /// concurrent change aborts the whole update instead of partially
+    /// applying it.
+    async fn update_row(
+        &self,
+        key: &str,
+        rename_to: Option<&str>,
+        value: Option<&str>,
+    ) -> Result<u64, ServiceError> {
+        let destination = rename_to.unwrap_or(key);
+        let mut expected: Option<String> = None;
+        if value.is_some() {
+            // Only an existing string whose complete value fits the
+            // 300-rune display cell is editable: a bounded preview must
+            // never replace a larger value, a non-UTF-8 blob, or a
+            // hash/list/set/zset.
+            let type_: String = self.query(redis::cmd("TYPE").arg(key)).await?;
+            if type_ != "string" {
+                return Err(ServiceError::new(format!(
+                    "cannot edit value: {key} is a {type_}, not a string"
+                )));
+            }
+            let reply = self
+                .query::<redis::Value>(redis::cmd("GET").arg(key))
+                .await?;
+            let current = match reply {
+                redis::Value::BulkString(bytes) => bytes,
+                redis::Value::Nil => {
+                    return Err(ServiceError::new(format!("key not found: {key}")));
+                }
+                other => {
+                    return Err(ServiceError::new(format!(
+                        "unexpected GET reply for {key}: {other:?}"
+                    )));
+                }
+            };
+            let current = String::from_utf8(current).map_err(|_| {
+                ServiceError::new(format!(
+                    "cannot edit value: the current value of {key} is not valid UTF-8"
+                ))
+            })?;
+            let runes = current.chars().count();
+            if runes > MAX_CELL {
+                return Err(ServiceError::new(format!(
+                    "cannot edit value: the current value of {key} has {runes} \
+                     characters, more than the {MAX_CELL} the workbench displays; \
+                     use SET for large strings"
+                )));
+            }
+            expected = Some(current);
+        }
+        if destination != key {
+            let exists: i64 = self.query(redis::cmd("EXISTS").arg(destination)).await?;
+            if exists > 0 {
+                return Err(ServiceError::new(format!(
+                    "destination key already exists: {destination}"
+                )));
+            }
+        }
+        // One atomic script: existence, type, and destination are
+        // re-checked inside; the validated current value is compared so a
+        // value changed by another client after validation aborts the
+        // whole update. Rename and SET never split across commands.
+        let script = "\
+local src = KEYS[1]
+local dst = ARGV[1]
+local want_value = ARGV[2]
+local expected = ARGV[3]
+local new_value = ARGV[4]
+if redis.call('EXISTS', src) == 0 then
+  return redis.error_reply('key not found: ' .. src)
+end
+if want_value == '1' then
+  local t = redis.call('TYPE', src).ok
+  if t ~= 'string' then
+    return redis.error_reply('cannot edit value: ' .. src .. ' is not a string (type ' .. t .. ')')
+  end
+  if redis.call('GET', src) ~= expected then
+    return redis.error_reply('cannot edit value: ' .. src .. ' changed concurrently')
+  end
+end
+if dst ~= src and redis.call('EXISTS', dst) == 1 then
+  return redis.error_reply('destination key already exists: ' .. dst)
+end
+if dst ~= src then
+  redis.call('RENAME', src, dst)
+end
+if want_value == '1' then
+  redis.call('SET', dst, new_value)
+end
+return 1
+";
+        if self.closed.load(Ordering::Relaxed) {
+            return Err(ServiceError::new("session closed"));
+        }
+        let mut guard = self.conn.lock().await;
+        let conn = guard
+            .as_mut()
+            .ok_or_else(|| ServiceError::new("session closed"))?;
+        let affected: i64 = redis::Script::new(script)
+            .key(key)
+            .arg(destination)
+            .arg(if value.is_some() { "1" } else { "0" })
+            .arg(expected.as_deref().unwrap_or(""))
+            .arg(value.unwrap_or(""))
+            .invoke_async(conn)
+            .await
+            .map_err(|e| ServiceError::new(format!("redis: {e}")))?;
+        Ok(affected.max(0) as u64)
+    }
 }
 
 /// Extracts `(member, value)` pairs from a scan-style reply, tolerating
@@ -980,6 +1325,31 @@ impl SessionService for RedisService {
         })
     }
 
+    fn row_write(
+        &self,
+        request: RowWriteRequest,
+        _cancel: CancellationToken,
+    ) -> ServiceFuture<'static, RowWriteResponse> {
+        let this = self.clone();
+        Box::pin(async move {
+            let rows_affected = match parse_row_write(&request)? {
+                RowWrite::Delete { key } => this.delete_row(&key).await?,
+                RowWrite::Update {
+                    key,
+                    rename_to,
+                    value,
+                } => {
+                    this.update_row(&key, rename_to.as_deref(), value.as_deref())
+                        .await?
+                }
+                RowWrite::Insert { key, value } => this.insert_row(&key, &value).await?,
+            };
+            Ok(RowWriteResponse {
+                result: RowsAffected { rows_affected },
+            })
+        })
+    }
+
     fn close(&self) {
         self.closed.store(true, Ordering::Relaxed);
         if let Ok(mut guard) = self.conn.try_lock() {
@@ -1066,6 +1436,7 @@ impl SessionFactory for RedisFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dto::write::Value;
 
     #[test]
     fn build_target_uses_defaults_for_blank_fields() {
@@ -1077,10 +1448,12 @@ mod tests {
 
     #[test]
     fn build_target_trims_and_applies_form_values() {
-        let mut values = FormValues::default();
-        values.host = Some("  db.example.com  ".to_string());
-        values.port = Some(" 6380 ".to_string());
-        values.database = Some(" 2 ".to_string());
+        let values = FormValues {
+            host: Some("  db.example.com  ".to_string()),
+            port: Some(" 6380 ".to_string()),
+            database: Some(" 2 ".to_string()),
+            ..Default::default()
+        };
         let result = RedisFactory::default().build_target(&values);
         assert!(result.ok);
         assert_eq!(result.target, "redis:redis://db.example.com:6380/2");
@@ -1088,9 +1461,11 @@ mod tests {
 
     #[test]
     fn build_target_percent_encodes_credentials() {
-        let mut values = FormValues::default();
-        values.user = Some("alice".to_string());
-        values.pass = Some("p@ss:w/rd".to_string());
+        let values = FormValues {
+            user: Some("alice".to_string()),
+            pass: Some("p@ss:w/rd".to_string()),
+            ..Default::default()
+        };
         let result = RedisFactory::default().build_target(&values);
         assert!(result.ok);
         assert_eq!(
@@ -1101,9 +1476,11 @@ mod tests {
 
     #[test]
     fn build_target_omits_blank_credentials() {
-        let mut values = FormValues::default();
-        values.user = Some("  ".to_string());
-        values.pass = Some("".to_string());
+        let values = FormValues {
+            user: Some("  ".to_string()),
+            pass: Some("".to_string()),
+            ..Default::default()
+        };
         let result = RedisFactory::default().build_target(&values);
         assert!(result.ok);
         assert_eq!(result.target, "redis:redis://127.0.0.1:6379/0");
@@ -1111,8 +1488,10 @@ mod tests {
 
     #[test]
     fn build_target_brackets_ipv6_hosts() {
-        let mut values = FormValues::default();
-        values.host = Some("::1".to_string());
+        let values = FormValues {
+            host: Some("::1".to_string()),
+            ..Default::default()
+        };
         let result = RedisFactory::default().build_target(&values);
         assert!(result.ok);
         assert_eq!(result.target, "redis:redis://[::1]:6379/0");
@@ -1121,8 +1500,10 @@ mod tests {
     #[test]
     fn build_target_rejects_invalid_database() {
         for bad in ["abc", "-1", "1.5", "0x10", "1_000"] {
-            let mut values = FormValues::default();
-            values.database = Some(bad.to_string());
+            let values = FormValues {
+                database: Some(bad.to_string()),
+                ..Default::default()
+            };
             let result = RedisFactory::default().build_target(&values);
             assert!(!result.ok, "database {bad:?} must be rejected");
         }
@@ -1131,8 +1512,10 @@ mod tests {
     #[test]
     fn build_target_rejects_invalid_port() {
         for bad in ["0", "70000", "abc", "-1"] {
-            let mut values = FormValues::default();
-            values.port = Some(bad.to_string());
+            let values = FormValues {
+                port: Some(bad.to_string()),
+                ..Default::default()
+            };
             let result = RedisFactory::default().build_target(&values);
             assert!(!result.ok, "port {bad:?} must be rejected");
         }
@@ -1364,5 +1747,361 @@ mod tests {
         assert_eq!(cap_cell("short"), "short");
         let exactly = "y".repeat(300);
         assert_eq!(cap_cell(&exactly), exactly);
+    }
+
+    fn string_cell(name: &str, value: &str) -> RowValue {
+        RowValue {
+            name: name.to_string(),
+            value: Value {
+                kind: "string".to_string(),
+                string: Some(value.to_string()),
+                bool_: None,
+                integer: None,
+                float: None,
+                bytes: None,
+                decimal: None,
+                timestamp: None,
+                array: None,
+                object: None,
+            },
+        }
+    }
+
+    fn value_of_kind(kind: &str) -> Value {
+        Value {
+            kind: kind.to_string(),
+            string: None,
+            bool_: None,
+            integer: None,
+            float: None,
+            bytes: None,
+            decimal: None,
+            timestamp: None,
+            array: None,
+            object: None,
+        }
+    }
+
+    fn request(operation: &str, key: Vec<RowValue>, values: Vec<RowValue>) -> RowWriteRequest {
+        RowWriteRequest {
+            operation: operation.to_string(),
+            table: KEYS_TABLE.to_string(),
+            key: (!key.is_empty()).then_some(key),
+            values: (!values.is_empty()).then_some(values),
+        }
+    }
+
+    #[test]
+    fn parse_row_write_accepts_each_operation() {
+        let delete =
+            parse_row_write(&request("delete", vec![string_cell("key", "k1")], vec![])).unwrap();
+        assert_eq!(delete, RowWrite::Delete { key: "k1".into() });
+
+        // An empty string is a valid Redis key identity: delete runs DEL
+        // and reports its actual count. Only the rename destination is
+        // rejected as empty.
+        let delete_empty =
+            parse_row_write(&request("delete", vec![string_cell("key", "")], vec![])).unwrap();
+        assert_eq!(delete_empty, RowWrite::Delete { key: String::new() });
+
+        let update = parse_row_write(&request(
+            "update",
+            vec![string_cell("key", "k1")],
+            vec![string_cell("key", "k2"), string_cell("value", "new value")],
+        ))
+        .unwrap();
+        assert_eq!(
+            update,
+            RowWrite::Update {
+                key: "k1".into(),
+                rename_to: Some("k2".into()),
+                value: Some("new value".into())
+            }
+        );
+
+        let insert = parse_row_write(&request(
+            "insert",
+            vec![],
+            vec![
+                string_cell("key", "k1"),
+                string_cell("type", "string"),
+                string_cell("value", "v"),
+            ],
+        ))
+        .unwrap();
+        assert_eq!(
+            insert,
+            RowWrite::Insert {
+                key: "k1".into(),
+                value: "v".into()
+            }
+        );
+
+        // A blank string type means string; a missing value is empty.
+        let blank = parse_row_write(&request(
+            "insert",
+            vec![],
+            vec![string_cell("key", "k2"), string_cell("type", "")],
+        ))
+        .unwrap();
+        assert_eq!(
+            blank,
+            RowWrite::Insert {
+                key: "k2".into(),
+                value: String::new()
+            }
+        );
+
+        // An empty key is an explicit string key: SET "" NX semantics.
+        let empty_key =
+            parse_row_write(&request("insert", vec![], vec![string_cell("key", "")])).unwrap();
+        assert_eq!(
+            empty_key,
+            RowWrite::Insert {
+                key: String::new(),
+                value: String::new()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_row_write_rejects_malformed_payloads() {
+        let mut bad = vec![
+            (request("delete", vec![], vec![]), "missing key fields"),
+            (
+                request(
+                    "delete",
+                    vec![string_cell("key", "k"), string_cell("key", "k2")],
+                    vec![],
+                ),
+                "duplicate key fields",
+            ),
+            (
+                request("delete", vec![string_cell("nope", "k")], vec![]),
+                "unknown key column",
+            ),
+            (
+                request(
+                    "delete",
+                    vec![string_cell("key", "k")],
+                    vec![string_cell("value", "v")],
+                ),
+                "delete does not accept a values payload",
+            ),
+            (
+                request("update", vec![], vec![string_cell("value", "v")]),
+                "missing key fields",
+            ),
+            (
+                request("update", vec![string_cell("key", "k")], vec![]),
+                "update requires a values payload",
+            ),
+            (
+                request(
+                    "update",
+                    vec![string_cell("key", "k")],
+                    vec![string_cell("type", "string")],
+                ),
+                "column type is immutable",
+            ),
+            (
+                request(
+                    "update",
+                    vec![string_cell("key", "k")],
+                    vec![string_cell("value", "v"), string_cell("value", "v2")],
+                ),
+                "duplicate column: value",
+            ),
+            (
+                request(
+                    "update",
+                    vec![string_cell("key", "k")],
+                    vec![string_cell("key", "")],
+                ),
+                "rename destination must not be empty",
+            ),
+            (
+                request(
+                    "update",
+                    vec![string_cell("key", "k")],
+                    vec![string_cell("other", "x")],
+                ),
+                "unknown column: other",
+            ),
+            (
+                request(
+                    "update",
+                    vec![string_cell("key", "k")],
+                    vec![string_cell("key", "k2"), string_cell("key", "k3")],
+                ),
+                "duplicate column: key",
+            ),
+            (
+                request("insert", vec![string_cell("key", "k")], vec![]),
+                "insert does not accept a key identity",
+            ),
+            (
+                request("insert", vec![], vec![]),
+                "insert requires a values payload",
+            ),
+            (
+                request("insert", vec![], vec![string_cell("value", "v")]),
+                "insert requires a key column",
+            ),
+            (
+                request(
+                    "insert",
+                    vec![],
+                    vec![string_cell("key", "k"), string_cell("type", "hash")],
+                ),
+                "only string",
+            ),
+            (
+                RowWriteRequest {
+                    operation: "insert".to_string(),
+                    table: KEYS_TABLE.to_string(),
+                    key: None,
+                    values: Some(vec![
+                        string_cell("key", "k"),
+                        RowValue {
+                            name: "type".to_string(),
+                            value: value_of_kind("default"),
+                        },
+                    ]),
+                },
+                "must be a string value",
+            ),
+            (
+                RowWriteRequest {
+                    operation: "insert".to_string(),
+                    table: KEYS_TABLE.to_string(),
+                    key: None,
+                    values: Some(vec![
+                        string_cell("key", "k"),
+                        RowValue {
+                            name: "type".to_string(),
+                            value: Value {
+                                kind: "string".to_string(),
+                                string: None,
+                                bool_: None,
+                                integer: None,
+                                float: None,
+                                bytes: None,
+                                decimal: None,
+                                timestamp: None,
+                                array: None,
+                                object: None,
+                            },
+                        },
+                    ]),
+                },
+                "without a payload",
+            ),
+            (
+                request(
+                    "insert",
+                    vec![],
+                    vec![string_cell("key", "k"), string_cell("type", "STRING")],
+                ),
+                "only string",
+            ),
+            (
+                request(
+                    "insert",
+                    vec![],
+                    vec![string_cell("key", "k"), string_cell("nope", "x")],
+                ),
+                "unknown column: nope",
+            ),
+            (
+                request("upsert", vec![string_cell("key", "k")], vec![]),
+                "unsupported row_write operation: upsert",
+            ),
+            (
+                RowWriteRequest {
+                    operation: "insert".to_string(),
+                    table: "nope".to_string(),
+                    key: None,
+                    values: Some(vec![string_cell("key", "k")]),
+                },
+                "unknown table: nope",
+            ),
+        ];
+        for (case, expected) in bad.drain(..) {
+            let err = parse_row_write(&case).expect_err("must be rejected");
+            assert!(
+                err.message.contains(expected),
+                "payload {case:?}: expected {expected:?}, got {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn parse_row_write_rejects_non_string_cell_kinds() {
+        for (label, cells) in [
+            (
+                "integer",
+                vec![RowValue {
+                    name: "value".into(),
+                    value: value_of_kind("integer"),
+                }],
+            ),
+            (
+                "bool",
+                vec![RowValue {
+                    name: "value".into(),
+                    value: value_of_kind("bool"),
+                }],
+            ),
+            (
+                "null",
+                vec![RowValue {
+                    name: "value".into(),
+                    value: value_of_kind("null"),
+                }],
+            ),
+            (
+                "default",
+                vec![RowValue {
+                    name: "value".into(),
+                    value: value_of_kind("default"),
+                }],
+            ),
+            (
+                "object",
+                vec![RowValue {
+                    name: "value".into(),
+                    value: value_of_kind("object"),
+                }],
+            ),
+            (
+                "string without payload",
+                vec![RowValue {
+                    name: "value".into(),
+                    value: Value {
+                        kind: "string".into(),
+                        string: None,
+                        bool_: None,
+                        integer: None,
+                        float: None,
+                        bytes: None,
+                        decimal: None,
+                        timestamp: None,
+                        array: None,
+                        object: None,
+                    },
+                }],
+            ),
+        ] {
+            let case = request("update", vec![string_cell("key", "k")], cells);
+            let err = parse_row_write(&case).expect_err("must be rejected");
+            assert!(
+                err.message.contains("must be a string value")
+                    || err.message.contains("without a payload"),
+                "kind {label}: {}",
+                err.message
+            );
+        }
     }
 }

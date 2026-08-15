@@ -9,11 +9,13 @@
 
 use std::sync::LazyLock;
 
+use redis::AsyncCommands;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use perk_redis::dto::request::{BrowseTableRequest, EmptyRequest, StatementRequest, TableRequest};
 use perk_redis::dto::service::{DatabaseInfo, QueryResult};
+use perk_redis::dto::write::{RowValue, RowWriteRequest, RowWriteResponse, Value};
 use perk_redis::redis_service::RedisFactory;
 use perk_redis::service::{ServiceError, SessionFactory, SessionService};
 
@@ -76,6 +78,70 @@ async fn validate(svc: &dyn SessionService, statement: &str) -> Result<(), Servi
         CancellationToken::new(),
     )
     .await
+}
+
+fn str_val(s: &str) -> Value {
+    Value {
+        kind: "string".to_string(),
+        string: Some(s.to_string()),
+        bool_: None,
+        integer: None,
+        float: None,
+        bytes: None,
+        decimal: None,
+        timestamp: None,
+        array: None,
+        object: None,
+    }
+}
+
+fn cell(name: &str, value: &str) -> RowValue {
+    RowValue {
+        name: name.to_string(),
+        value: str_val(value),
+    }
+}
+
+fn insert_req(key: &str, value: &str) -> RowWriteRequest {
+    RowWriteRequest {
+        operation: "insert".to_string(),
+        table: "keys".to_string(),
+        key: None,
+        values: Some(vec![cell("key", key), cell("value", value)]),
+    }
+}
+
+fn update_req(key: &str, changes: Vec<RowValue>) -> RowWriteRequest {
+    RowWriteRequest {
+        operation: "update".to_string(),
+        table: "keys".to_string(),
+        key: Some(vec![cell("key", key)]),
+        values: Some(changes),
+    }
+}
+
+fn delete_req(key: &str) -> RowWriteRequest {
+    RowWriteRequest {
+        operation: "delete".to_string(),
+        table: "keys".to_string(),
+        key: Some(vec![cell("key", key)]),
+        values: None,
+    }
+}
+
+async fn row_write(
+    svc: &dyn SessionService,
+    request: RowWriteRequest,
+) -> Result<RowWriteResponse, ServiceError> {
+    svc.row_write(request, CancellationToken::new()).await
+}
+
+async fn row_write_ok(svc: &dyn SessionService, request: RowWriteRequest) -> u64 {
+    row_write(svc, request)
+        .await
+        .unwrap_or_else(|e| panic!("row_write failed: {e:?}"))
+        .result
+        .rows_affected
 }
 
 #[tokio::test]
@@ -715,4 +781,363 @@ async fn close_is_idempotent_and_new_sessions_are_fresh() {
     let got = exec_ok(&*svc2, "GET fresh-probe").await;
     assert_eq!(got.rows, vec![vec![Some("v".to_string())]]);
     svc2.close();
+}
+
+#[tokio::test]
+async fn row_write_insert_creates_strings_and_rejects_collisions() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+
+    assert_eq!(row_write_ok(&*svc, insert_req("rw-ins", "v1")).await, 1);
+    let got = exec_ok(&*svc, "GET rw-ins").await;
+    assert_eq!(got.rows, vec![vec![Some("v1".to_string())]]);
+    let type_ = exec_ok(&*svc, "TYPE rw-ins").await;
+    assert_eq!(type_.rows, vec![vec![Some("string".to_string())]]);
+
+    // Explicit `type` "string" and a blank type both insert strings; a
+    // missing `value` inserts the empty string.
+    let mut with_type = insert_req("rw-ins2", "v2");
+    with_type
+        .values
+        .as_mut()
+        .unwrap()
+        .push(cell("type", "string"));
+    assert_eq!(row_write_ok(&*svc, with_type).await, 1);
+    let mut blank_type = insert_req("rw-ins3", "v3");
+    blank_type.values.as_mut().unwrap().push(cell("type", ""));
+    assert_eq!(row_write_ok(&*svc, blank_type).await, 1);
+    let mut no_value = insert_req("rw-ins4", "");
+    no_value.values.as_mut().unwrap().pop();
+    assert_eq!(row_write_ok(&*svc, no_value).await, 1);
+    assert_eq!(
+        exec_ok(&*svc, "GET rw-ins4").await.rows,
+        vec![vec![Some(String::new())]]
+    );
+    assert_eq!(
+        exec_ok(&*svc, "DBSIZE").await.rows,
+        vec![vec![Some("4".to_string())]]
+    );
+
+    // A collision is rejected and the stored value is untouched.
+    let err = row_write(&*svc, insert_req("rw-ins", "v1b"))
+        .await
+        .expect_err("collision must be rejected");
+    assert!(err.message.contains("already exists"), "{}", err.message);
+    let got = exec_ok(&*svc, "GET rw-ins").await;
+    assert_eq!(got.rows, vec![vec![Some("v1".to_string())]]);
+
+    // Collection types are rejected on insert; nothing is created.
+    let mut hash_type = insert_req("rw-hash", "v");
+    hash_type
+        .values
+        .as_mut()
+        .unwrap()
+        .push(cell("type", "hash"));
+    let err = row_write(&*svc, hash_type)
+        .await
+        .expect_err("hash type must be rejected");
+    assert!(err.message.contains("only string"), "{}", err.message);
+    assert_eq!(
+        exec_ok(&*svc, "EXISTS rw-hash").await.rows,
+        vec![vec![Some("0".to_string())]]
+    );
+
+    svc.close();
+}
+
+#[tokio::test]
+async fn row_write_update_edits_strings_and_renames() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+
+    exec_ok(&*svc, "SET rw-up v").await;
+
+    // Value edit: the complete string is replaced with SET.
+    assert_eq!(
+        row_write_ok(&*svc, update_req("rw-up", vec![cell("value", "edited")])).await,
+        1
+    );
+    let got = exec_ok(&*svc, "GET rw-up").await;
+    assert_eq!(got.rows, vec![vec![Some("edited".to_string())]]);
+
+    // The guard is on the current value, not the new one: a 400-rune
+    // explicit replacement of a short string is an accepted edit.
+    let huge_new = "z".repeat(400);
+    assert_eq!(
+        row_write_ok(&*svc, update_req("rw-up", vec![cell("value", &huge_new)])).await,
+        1
+    );
+    let got = exec_ok(&*svc, "GET rw-up").await;
+    assert_eq!(got.untruncated_rows, vec![vec![Some(huge_new)]]);
+
+    // Updating a missing key is an error.
+    let err = row_write(&*svc, update_req("rw-missing", vec![cell("value", "x")]))
+        .await
+        .expect_err("missing key must be rejected");
+    assert!(err.message.contains("rw-missing"), "{}", err.message);
+
+    // Rename: the `key` column change moves the existing key.
+    assert_eq!(
+        row_write_ok(&*svc, update_req("rw-up", vec![cell("key", "rw-renamed")])).await,
+        1
+    );
+    assert_eq!(
+        exec_ok(&*svc, "EXISTS rw-up").await.rows,
+        vec![vec![Some("0".to_string())]]
+    );
+    let got = exec_ok(&*svc, "GET rw-renamed").await;
+    assert_eq!(got.untruncated_rows, vec![vec![Some("z".repeat(400))]]);
+
+    // A rename onto an existing key is rejected; nothing moves.
+    exec_ok(&*svc, "SET rw-other other").await;
+    let err = row_write(
+        &*svc,
+        update_req("rw-renamed", vec![cell("key", "rw-other")]),
+    )
+    .await
+    .expect_err("destination collision must be rejected");
+    assert!(err.message.contains("already exists"), "{}", err.message);
+    assert_eq!(
+        exec_ok(&*svc, "GET rw-renamed").await.untruncated_rows[0][0].as_deref(),
+        Some("z".repeat(400).as_str())
+    );
+    assert_eq!(
+        exec_ok(&*svc, "GET rw-other").await.rows,
+        vec![vec![Some("other".to_string())]]
+    );
+
+    // Same-name rename is a successful no-op.
+    assert_eq!(
+        row_write_ok(
+            &*svc,
+            update_req("rw-renamed", vec![cell("key", "rw-renamed")])
+        )
+        .await,
+        1
+    );
+
+    // Rename works on non-string types: the type travels unchanged.
+    exec_ok(&*svc, "HSET rw-h f v").await;
+    assert_eq!(
+        row_write_ok(&*svc, update_req("rw-h", vec![cell("key", "rw-h2")])).await,
+        1
+    );
+    assert_eq!(
+        exec_ok(&*svc, "TYPE rw-h2").await.rows,
+        vec![vec![Some("hash".to_string())]]
+    );
+    assert_eq!(
+        exec_ok(&*svc, "HGETALL rw-h2").await.rows,
+        vec![
+            vec![Some("0".to_string()), Some("f".to_string())],
+            vec![Some("1".to_string()), Some("v".to_string())],
+        ]
+    );
+
+    svc.close();
+}
+
+#[tokio::test]
+async fn row_write_update_rejects_unsafe_value_edits_without_mutation() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+
+    // Collection value edits are rejected and the collections stay intact.
+    exec_ok(&*svc, "HSET rw-colh f v").await;
+    let err = row_write(
+        &*svc,
+        update_req("rw-colh", vec![cell("value", "hijacked")]),
+    )
+    .await
+    .expect_err("hash value edit must be rejected");
+    assert!(err.message.contains("not a string"), "{}", err.message);
+    assert_eq!(
+        exec_ok(&*svc, "HGETALL rw-colh").await.rows,
+        vec![
+            vec![Some("0".to_string()), Some("f".to_string())],
+            vec![Some("1".to_string()), Some("v".to_string())],
+        ]
+    );
+
+    exec_ok(&*svc, "RPUSH rw-coll a b").await;
+    let err = row_write(&*svc, update_req("rw-coll", vec![cell("value", "x")]))
+        .await
+        .expect_err("list value edit must be rejected");
+    assert!(err.message.contains("not a string"), "{}", err.message);
+    assert_eq!(exec_ok(&*svc, "LRANGE rw-coll 0 -1").await.rows.len(), 2);
+
+    // A value over the 300-rune display cell is rejected and the stored
+    // value stays byte-for-byte unchanged.
+    let long = "x".repeat(400);
+    exec_ok(&*svc, &format!("SET rw-long {long}")).await;
+    let err = row_write(&*svc, update_req("rw-long", vec![cell("value", "short")]))
+        .await
+        .expect_err("long value edit must be rejected");
+    assert!(err.message.contains("300"), "{}", err.message);
+    let got = exec_ok(&*svc, "GET rw-long").await;
+    assert_eq!(got.untruncated_rows, vec![vec![Some(long.clone())]]);
+
+    // Exactly 300 runes is representable without truncation: editable.
+    let exact = "y".repeat(300);
+    exec_ok(&*svc, &format!("SET rw-exact {exact}")).await;
+    assert_eq!(
+        row_write_ok(&*svc, update_req("rw-exact", vec![cell("value", "ok")])).await,
+        1
+    );
+    assert_eq!(
+        exec_ok(&*svc, "GET rw-exact").await.rows,
+        vec![vec![Some("ok".to_string())]]
+    );
+
+    // A non-UTF-8 value is rejected; the raw bytes are untouched (checked
+    // outside the plugin's lossy display path).
+    let client = redis::Client::open(url.clone()).expect("open raw client");
+    let mut conn = client
+        .get_connection_manager()
+        .await
+        .expect("connect raw client");
+    let bad = vec![0xffu8, 0xfe, 0x00, 0x41];
+    conn.set::<_, _, ()>("rw-bad", bad.clone())
+        .await
+        .expect("set raw bytes");
+    let err = row_write(&*svc, update_req("rw-bad", vec![cell("value", "x")]))
+        .await
+        .expect_err("non-UTF-8 edit must be rejected");
+    assert!(err.message.contains("UTF-8"), "{}", err.message);
+    let raw: Vec<u8> = conn.get("rw-bad").await.expect("get raw bytes");
+    assert_eq!(raw, bad, "stored bytes must be unchanged");
+
+    // Type is immutable: any `type` change is rejected before mutation.
+    exec_ok(&*svc, "SET rw-typ v").await;
+    for type_value in ["hash", "string", ""] {
+        let err = row_write(&*svc, update_req("rw-typ", vec![cell("type", type_value)]))
+            .await
+            .expect_err("type change must be rejected");
+        assert!(err.message.contains("immutable"), "{}", err.message);
+    }
+    assert_eq!(
+        exec_ok(&*svc, "TYPE rw-typ").await.rows,
+        vec![vec![Some("string".to_string())]]
+    );
+
+    svc.close();
+}
+
+#[tokio::test]
+async fn row_write_update_rename_plus_value_is_atomic() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+
+    // Rename and value change apply together: one row, moved and replaced.
+    exec_ok(&*svc, "SET rw-src old").await;
+    assert_eq!(
+        row_write_ok(
+            &*svc,
+            update_req("rw-src", vec![cell("key", "rw-dst"), cell("value", "new")])
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        exec_ok(&*svc, "EXISTS rw-src").await.rows,
+        vec![vec![Some("0".to_string())]]
+    );
+    let got = exec_ok(&*svc, "GET rw-dst").await;
+    assert_eq!(got.rows, vec![vec![Some("new".to_string())]]);
+
+    // Destination collision with a value change: nothing mutates at all.
+    exec_ok(&*svc, "SET rw-src2 v").await;
+    exec_ok(&*svc, "SET rw-dst2 occupied").await;
+    let err = row_write(
+        &*svc,
+        update_req("rw-src2", vec![cell("key", "rw-dst2"), cell("value", "w")]),
+    )
+    .await
+    .expect_err("destination collision must be rejected");
+    assert!(err.message.contains("already exists"), "{}", err.message);
+    assert_eq!(
+        exec_ok(&*svc, "GET rw-src2").await.rows,
+        vec![vec![Some("v".to_string())]]
+    );
+    assert_eq!(
+        exec_ok(&*svc, "GET rw-dst2").await.rows,
+        vec![vec![Some("occupied".to_string())]]
+    );
+
+    // A hash source with a combined change: the value part is rejected
+    // before any rename happens.
+    exec_ok(&*svc, "HSET rw-hsrc f v").await;
+    let err = row_write(
+        &*svc,
+        update_req("rw-hsrc", vec![cell("key", "rw-hdst"), cell("value", "w")]),
+    )
+    .await
+    .expect_err("hash value change must be rejected");
+    assert!(err.message.contains("not a string"), "{}", err.message);
+    assert_eq!(
+        exec_ok(&*svc, "TYPE rw-hsrc").await.rows,
+        vec![vec![Some("hash".to_string())]]
+    );
+    assert_eq!(
+        exec_ok(&*svc, "EXISTS rw-hdst").await.rows,
+        vec![vec![Some("0".to_string())]]
+    );
+    assert_eq!(
+        exec_ok(&*svc, "HGETALL rw-hsrc").await.rows,
+        vec![
+            vec![Some("0".to_string()), Some("f".to_string())],
+            vec![Some("1".to_string()), Some("v".to_string())],
+        ]
+    );
+
+    svc.close();
+}
+
+#[tokio::test]
+async fn row_write_delete_reports_actual_rows_affected() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+
+    exec_ok(&*svc, "SET rw-del v").await;
+    assert_eq!(row_write_ok(&*svc, delete_req("rw-del")).await, 1);
+    assert_eq!(
+        exec_ok(&*svc, "EXISTS rw-del").await.rows,
+        vec![vec![Some("0".to_string())]]
+    );
+    // DEL's actual count: a missing key reports 0, not an error.
+    assert_eq!(row_write_ok(&*svc, delete_req("rw-del")).await, 0);
+    assert_eq!(row_write_ok(&*svc, delete_req("rw-never")).await, 0);
+
+    // An empty-string key is a valid Redis key: delete runs DEL and
+    // reports its actual count.
+    exec_ok(&*svc, "SET \"\" empty-key-value").await;
+    assert_eq!(row_write_ok(&*svc, delete_req("")).await, 1);
+    assert_eq!(row_write_ok(&*svc, delete_req("")).await, 0);
+
+    svc.close();
 }
