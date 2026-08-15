@@ -5,18 +5,20 @@
 //! process exits success on stdin EOF and non-zero on a terminal protocol
 //! violation.
 
-mod dto;
-mod protocol;
-mod server;
-mod service;
+use std::sync::Arc;
 
 use tokio::io::BufReader;
+
+use perk_redis::redis_service::RedisFactory;
+use perk_redis::server::{self, DirectStdout};
+use perk_redis::service::SessionFactory;
 
 #[tokio::main]
 async fn main() {
     let stdin = tokio::io::stdin();
-    let stdout = server::DirectStdout::new();
-    match server::run(BufReader::new(stdin), stdout).await {
+    let stdout = DirectStdout::new();
+    let factory: Arc<dyn SessionFactory> = Arc::new(RedisFactory::default());
+    match server::run(BufReader::new(stdin), stdout, factory).await {
         Ok(()) => {}
         Err(e) => {
             eprintln!("[perk-redis] fatal: {e}");

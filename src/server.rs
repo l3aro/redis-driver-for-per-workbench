@@ -32,7 +32,7 @@ use crate::protocol::{
     ERR_INVALID_PARAMS, ERR_INVALID_REQUEST, ERR_METHOD_NOT_FOUND, ProtocolError, Response,
     ServerError, frame_bytes, read_frame,
 };
-use crate::service::{MemoryFactory, ServiceError, SessionFactory, SessionService};
+use crate::service::{ServiceError, SessionFactory, SessionService};
 
 /// The 20 mandatory session methods.
 const SESSION_METHODS: [&str; 20] = [
@@ -355,10 +355,10 @@ impl Server {
 
     fn handle_cancel(&self, params: Option<Value>, _sink: &Sink) {
         // Unknown cancel ids are ignored (the request already answered).
-        if let Some(params) = params {
-            if let Ok(request) = serde_json::from_value::<CancelRequest>(params) {
-                self.registry.cancel(request.id);
-            }
+        if let Some(params) = params
+            && let Ok(request) = serde_json::from_value::<CancelRequest>(params)
+        {
+            self.registry.cancel(request.id);
         }
     }
 
@@ -391,7 +391,7 @@ impl Server {
                 return;
             }
         };
-        let (info, service) = match self.factory.open(&request.target) {
+        let (info, service) = match self.factory.open(&request.target).await {
             Ok(v) => v,
             Err(e) => {
                 sink.send(frame_bytes(&error_response(Some(id), &e)));
@@ -601,6 +601,12 @@ impl DirectStdout {
     }
 }
 
+impl Default for DirectStdout {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl tokio::io::AsyncWrite for DirectStdout {
     fn poll_write(
         self: Pin<&mut Self>,
@@ -623,7 +629,14 @@ impl tokio::io::AsyncWrite for DirectStdout {
 /// the server exits cleanly; on a terminal error it returns the violation
 /// after aborting in-flight requests. In both cases no further frames are
 /// written.
-pub async fn run<R, W>(reader: R, output: W) -> Result<(), ServerError>
+///
+/// `factory` provides the driver: the real [`crate::redis_service::RedisFactory`]
+/// in production, the in-memory service in transport tests.
+pub async fn run<R, W>(
+    reader: R,
+    output: W,
+    factory: Arc<dyn SessionFactory>,
+) -> Result<(), ServerError>
 where
     R: AsyncBufRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -647,7 +660,7 @@ where
         Ok::<(), std::io::Error>(())
     });
 
-    let mut server = Server::new(Arc::new(MemoryFactory::default()));
+    let mut server = Server::new(factory);
     let mut reader = reader;
     let result = server.serve(&mut reader, &writer_sink).await;
 
@@ -675,6 +688,7 @@ mod tests {
 
     use super::*;
     use crate::protocol::ERR_CANCELED;
+    use crate::service::MemoryFactory;
 
     /// In-memory output buffer implementing `AsyncWrite`. `take_line`
     /// drains the readable buffer; `transcript` keeps an append-only copy
@@ -732,7 +746,11 @@ mod tests {
         async fn start() -> Self {
             let (client, server_side) = tokio::io::duplex(1 << 16);
             let output = SharedBuf::default();
-            let task = tokio::spawn(run(BufReader::new(server_side), output.clone()));
+            let task = tokio::spawn(run(
+                BufReader::new(server_side),
+                output.clone(),
+                Arc::new(MemoryFactory::default()),
+            ));
             Harness {
                 input: client,
                 output,
@@ -1132,7 +1150,7 @@ mod tests {
         let response = h.response().await;
         assert_eq!(
             response["result"],
-            json!({"target": "redis:db.example.com:6380/2", "ok": true})
+            json!({"target": "redis:redis://db.example.com:6380/2", "ok": true})
         );
         h.finish().await.expect("clean EOF exit");
     }

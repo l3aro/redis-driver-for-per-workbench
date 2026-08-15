@@ -1,6 +1,7 @@
-//! Session service contract and the in-memory test service that proves
-//! routing. The real Redis adapter replaces `MemoryFactory` in a later
-//! change; the trait below is the seam it plugs into.
+//! Session service contract, plus the in-memory service used as a
+//! transport test double. Production sessions come from
+//! [`crate::redis_service::RedisFactory`]; the trait below is the seam
+//! both plug into.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -23,6 +24,16 @@ use crate::dto::service::{
 use crate::protocol::ERR_CANCELED;
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ServiceError>> + Send + 'a>>;
+
+/// The future returned by [`SessionFactory::open`]. Boxed so the trait
+/// stays dyn-compatible (the server holds `Arc<dyn SessionFactory>`).
+pub type OpenFuture<'a> = Pin<
+    Box<
+        dyn Future<Output = Result<(DatabaseInfo, Box<dyn SessionService>), ServiceError>>
+            + Send
+            + 'a,
+    >,
+>;
 
 /// Handler error. `code: None` becomes the JSON-RPC internal error
 /// (-32603); a present code is used as-is (e.g. -32800 canceled).
@@ -169,10 +180,13 @@ pub trait SessionService: Send + Sync {
 }
 
 /// Creates sessions and serializes connection forms. The Redis adapter
-/// atom replaces the memory-backed implementation.
+/// (see [`crate::redis_service`]) is the production implementation;
+/// [`MemoryFactory`] is the transport test double.
 pub trait SessionFactory: Send + Sync {
     fn build_target(&self, values: &FormValues) -> BuildTargetResult;
-    fn open(&self, target: &str) -> Result<(DatabaseInfo, Box<dyn SessionService>), ServiceError>;
+    /// Opens one session. The target is the connection target with a
+    /// stripped label prefix (or a whole URL-scheme target).
+    fn open<'a>(&'a self, target: &'a str) -> OpenFuture<'a>;
 }
 
 fn stub_result(
@@ -193,8 +207,9 @@ fn stub_result(
     }
 }
 
-/// In-memory key-value session service: proves full perk/v1 routing with
-/// SET/GET/DEL statements and a blocking SLEEP that aborts on cancellation.
+/// In-memory key-value session service: the transport test double. Proves
+/// full perk/v1 routing with SET/GET/DEL statements and a blocking SLEEP
+/// that aborts on cancellation, with no Redis required.
 pub struct MemoryService {
     name: String,
     store: Arc<Mutex<HashMap<String, String>>>,
@@ -521,12 +536,16 @@ impl SessionService for MemoryService {
 }
 
 /// Builds targets and opens sessions against the in-memory test store.
-/// Replaced by the Redis adapter in a later change.
+/// Transport tests pass this factory into [`crate::server::run`]; the
+/// production binary uses [`crate::redis_service::RedisFactory`].
 #[derive(Default)]
 pub struct MemoryFactory {}
 
 impl SessionFactory for MemoryFactory {
     fn build_target(&self, values: &FormValues) -> BuildTargetResult {
+        // Mirrors the real factory's serialization so the transport test
+        // exercises the production wire format (credentials are ignored
+        // by the in-memory double).
         let host = values
             .host
             .as_deref()
@@ -546,18 +565,22 @@ impl SessionFactory for MemoryFactory {
             .filter(|s| !s.is_empty())
             .unwrap_or("0");
         BuildTargetResult {
-            target: format!("redis:{host}:{port}/{database}"),
+            target: format!("redis:redis://{host}:{port}/{database}"),
             ok: true,
         }
     }
 
-    fn open(&self, target: &str) -> Result<(DatabaseInfo, Box<dyn SessionService>), ServiceError> {
-        Ok((
-            DatabaseInfo {
-                product: "Redis (stub)".to_string(),
-                version: "0.0.0".to_string(),
-            },
-            Box::new(MemoryService::new(target.trim().to_string())),
-        ))
+    fn open<'a>(&'a self, target: &'a str) -> OpenFuture<'a> {
+        let service: Box<dyn SessionService> =
+            Box::new(MemoryService::new(target.trim().to_string()));
+        Box::pin(async move {
+            Ok((
+                DatabaseInfo {
+                    product: "Redis (stub)".to_string(),
+                    version: "0.0.0".to_string(),
+                },
+                service,
+            ))
+        })
     }
 }
