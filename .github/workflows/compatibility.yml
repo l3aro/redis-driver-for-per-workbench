@@ -1,0 +1,70 @@
+name: compatibility
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compatibility:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout perk-redis
+        uses: actions/checkout@v4
+        with:
+          path: perk-redis
+      - name: Checkout perk-workbench (default branch)
+        uses: actions/checkout@v4
+        with:
+          repository: l3aro/perk-workbench
+          path: source
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.25"
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Check formatting
+        working-directory: perk-redis
+        run: cargo fmt --check
+      - name: Clippy with warnings denied
+        working-directory: perk-redis
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Unit tests (no Redis required)
+        working-directory: perk-redis
+        run: cargo test --locked
+      - name: Build plugin
+        working-directory: perk-redis
+        run: cargo build --locked
+      - name: Start Redis fixture
+        working-directory: perk-redis
+        run: docker compose up -d --wait
+      - name: Seed demo data
+        working-directory: perk-redis
+        run: scripts/seed-demo.sh
+      - name: Integration tests against live Redis
+        working-directory: perk-redis
+        env:
+          REDIS_URL: redis://:workbench-demo@127.0.0.1:6380/2
+        run: cargo test --locked --test redis_integration
+      - name: Build workbench host
+        working-directory: source
+        run: go build ./cmd/perk-workbench
+      - name: Plugin conformance suite (16 cases, no Redis)
+        working-directory: source
+        run: |
+          set -o pipefail
+          ./perk-workbench plugin test --json "${{ github.workspace }}/perk-redis/target/debug/perk-redis" \
+            | tee "$RUNNER_TEMP/plugin-test.json"
+          jq -e '.ok == true and .passed == 16 and .failed == 0 and ([.cases[] | select(.ok == false)] | length) == 0' \
+            "$RUNNER_TEMP/plugin-test.json"
+      - name: Tear down Redis fixture
+        if: always()
+        working-directory: perk-redis
+        run: docker compose down --volumes --remove-orphans

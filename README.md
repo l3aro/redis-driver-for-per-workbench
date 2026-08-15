@@ -257,6 +257,23 @@ docker compose down --volumes
 Stops and removes the fixture container and any of its volumes, leaving
 nothing listening on `127.0.0.1:6380`.
 
+## Continuous integration
+
+`.github/workflows/compatibility.yml` runs on every push, pull request,
+and manual `workflow_dispatch`. It checks formatting, clippy, and unit
+tests; builds the plugin with the lockfile; starts and seeds the
+loopback Compose fixture and runs the full integration suite against it;
+then builds the latest `l3aro/perk-workbench` default branch and runs
+its plugin conformance suite (`plugin test --json`, 16 transport cases)
+against the built plugin. The fixture is torn down unconditionally when
+the job ends.
+
+The workflow is a **drift canary**: it validates against the current
+default branch of the host rather than a pinned release, so it becomes
+active only once this repository is hosted at its remote and tracks
+whatever the host mainline is today. It intentionally claims no stable
+release compatibility matrix.
+
 ## Layout
 
 | Path | Purpose |
