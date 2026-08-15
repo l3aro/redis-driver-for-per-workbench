@@ -515,6 +515,90 @@ async fn virtual_keys_schema_and_browse_paging() {
 }
 
 #[tokio::test]
+async fn virtual_table_select_is_accepted_through_sql_execute() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+
+    exec_ok(&*svc, "SET b-key bval").await;
+    exec_ok(&*svc, "SET a-key aval").await;
+    exec_ok(&*svc, "SET c-key cval").await;
+    exec_ok(&*svc, "HSET h-key f1 v1").await;
+    exec_ok(&*svc, "RPUSH l-key x y").await;
+
+    // The exact host-generated browse statement must be accepted through
+    // the SQL execute path too, returning the same virtual-table rows as
+    // browse_table: sorted keys with type and bounded value previews.
+    let stmt = r#"SELECT * FROM "keys" LIMIT 25 OFFSET 0"#;
+    validate(&*svc, stmt)
+        .await
+        .expect("the quoted virtual-table SELECT must validate");
+    let result = exec_ok(&*svc, stmt).await;
+    assert_eq!(result.columns, vec!["key", "type", "value"]);
+    let keys: Vec<&str> = result
+        .rows
+        .iter()
+        .map(|row| row[0].as_deref().expect("key cell"))
+        .collect();
+    assert_eq!(keys, vec!["a-key", "b-key", "c-key", "h-key", "l-key"]);
+    assert_eq!(result.rows[0][1].as_deref(), Some("string"));
+    assert_eq!(result.rows[0][2].as_deref(), Some("aval"));
+    assert!(!result.has_more && !result.truncated);
+
+    // The read-only path serves the same virtual-table SELECT.
+    let ro = read_only(&*svc, stmt)
+        .await
+        .expect("virtual-table SELECT is read-only");
+    assert_eq!(ro.rows.len(), 5);
+
+    // LIMIT/OFFSET paging through SQL mirrors browse paging.
+    let page = exec_ok(&*svc, "SELECT * FROM keys LIMIT 2 OFFSET 1").await;
+    assert_eq!(page.rows.len(), 2);
+    assert_eq!(page.rows[0][0].as_deref(), Some("b-key"));
+    assert_eq!(page.rows[1][0].as_deref(), Some("c-key"));
+    assert!(page.has_more);
+
+    // A huge OFFSET must stay an empty page, not overflow the
+    // end-of-page check.
+    let far = exec_ok(
+        &*svc,
+        "SELECT * FROM keys LIMIT 25 OFFSET 18446744073709551615",
+    )
+    .await;
+    assert_eq!(far.rows.len(), 0);
+    assert!(!far.has_more && !far.truncated);
+
+    // Malformed quoting and unknown tables stay operation errors.
+    for bad in [
+        r#"SELECT * FROM "keys"#,
+        "SELECT * FROM 'keys LIMIT 1",
+        r#"SELECT * FROM "nope" LIMIT 25 OFFSET 0"#,
+        "SELECT * FROM",
+        "SELECT * FROM keys LIMIT nope",
+    ] {
+        let err = exec_async(&*svc, bad)
+            .await
+            .expect_err("malformed SELECT must be rejected");
+        assert!(
+            err.message.starts_with("invalid statement"),
+            "unexpected error for {bad:?}: {}",
+            err.message
+        );
+    }
+
+    // Native Redis commands keep working unchanged.
+    exec_ok(&*svc, "PING").await;
+    let got = exec_ok(&*svc, "GET a-key").await;
+    assert_eq!(got.rows, vec![vec![Some("aval".to_string())]]);
+
+    svc.close();
+}
+
+#[tokio::test]
 async fn command_errors_do_not_terminate_the_session() {
     let Some(url) = redis_url() else {
         eprintln!("skipping: REDIS_URL is not set");

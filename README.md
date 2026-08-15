@@ -113,6 +113,15 @@ plugin's stdout carries only protocol frames.
 - **GET greeting** — press `F5`; the seeded greeting value is returned.
 - **HGETALL user:1** — the seeded hash rows (`name`, `email`, `role`).
 - **SCAN 0** — one row per key in database 2.
+- **`SELECT * FROM "keys" LIMIT 25 OFFSET 0`** — the host-generated
+  browse statement is accepted through the SQL editor exactly like the
+  browse RPC: `execute`, `execute_read_only`, and `validate` route
+  `SELECT * FROM "keys" [LIMIT n] [OFFSET m]` (quoted or bare table,
+  either clause order, optional trailing `;`) to the same paged keys
+  browse. Other `SELECT * FROM ...` shapes (unknown tables, extra
+  clauses, malformed quoting) stay operation errors, and native Redis
+  commands — including the `SELECT <db>` connection command — are
+  unchanged.
 
 Quit with `Ctrl+C` (or `Ctrl+Q` → Quit when the SQL editor holds text).
 

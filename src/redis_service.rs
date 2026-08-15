@@ -5,7 +5,9 @@
 //! [`SessionFactory::open`]; direct `redis://` targets reach `open`
 //! unchanged) and opens real sessions: one Tokio connection manager per
 //! session, `INFO server` at open, and raw command forwarding for
-//! execute/validate. The virtual schema exposes one fixed `keys` table
+//! execute/validate. Host-generated virtual-table SELECTs
+//! (`SELECT * FROM "keys" ...`) route to the keys browse instead of
+//! Redis. The virtual schema exposes one fixed `keys` table
 //! over the selected logical database; the service never advertises row
 //! or document writes.
 
@@ -92,14 +94,121 @@ fn keys_columns() -> Vec<ColumnInfo> {
     ]
 }
 
+/// One parsed statement: either a native Redis command line (the default
+/// execute/validate surface) or a virtual-table SELECT over the fixed
+/// `keys` table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Statement {
+    /// A native Redis command line, kept tokenized as typed.
+    Redis(Vec<String>),
+    /// `SELECT * FROM "keys" [LIMIT n] [OFFSET m]`: a browse over the
+    /// virtual keys table, paged like `browse_table`.
+    SelectKeys { offset: usize, limit: Option<usize> },
+}
+
 /// Parses one statement with shell quoting rules. Blank statements and
 /// malformed quoting are operation errors; a parseable statement is
-/// accepted without any Redis I/O (validate semantics).
-fn parse_statement(statement: &str) -> Result<Vec<String>, ServiceError> {
+/// accepted without any Redis I/O (validate semantics). Statements
+/// whose first token is `SELECT *` are parsed against the virtual keys
+/// table grammar; everything else stays a native Redis command line.
+fn parse_statement(statement: &str) -> Result<Statement, ServiceError> {
     if statement.trim().is_empty() {
         return Err(ServiceError::new("empty statement"));
     }
-    shell_words::split(statement).map_err(|e| ServiceError::new(format!("invalid statement: {e}")))
+    let tokens = shell_words::split(statement)
+        .map_err(|e| ServiceError::new(format!("invalid statement: {e}")))?;
+    // `SELECT *` is unambiguous: Redis's SELECT takes a database index,
+    // never `*`, so only a virtual-table query can start this way. Any
+    // other SELECT (e.g. the native `SELECT 2`) stays a Redis command.
+    if tokens
+        .first()
+        .is_some_and(|t| t.eq_ignore_ascii_case("SELECT"))
+        && tokens.get(1).is_some_and(|t| t == "*")
+    {
+        return parse_select(&tokens);
+    }
+    Ok(Statement::Redis(tokens))
+}
+
+/// Parses the host-generated virtual-table SELECT grammar
+/// `SELECT * FROM <table> [LIMIT <n>] [OFFSET <m>]`, optionally ended
+/// by a single `;` (whitespace-separated or glued to the last token).
+/// The table identifier is matched case-insensitively against the fixed
+/// `keys` table whether double-quoted or bare; LIMIT and OFFSET are
+/// non-negative integers in either order.
+fn parse_select(tokens: &[String]) -> Result<Statement, ServiceError> {
+    let bad = |message: String| ServiceError::new(format!("invalid statement: {message}"));
+    // A `;` glued to the final token is the statement terminator
+    // (`LIMIT 25;`); anywhere else it stays part of the token so a
+    // terminator can never hide trailing clauses. A standalone final
+    // `;` is handled by the clause loop below.
+    let mut tokens = tokens.to_vec();
+    if let Some(last) = tokens.last_mut()
+        && let Some(stripped) = last.strip_suffix(';')
+        && !stripped.is_empty()
+    {
+        *last = stripped.to_string();
+    }
+    if tokens
+        .get(2)
+        .is_none_or(|t| !t.eq_ignore_ascii_case("FROM"))
+    {
+        return Err(bad("expected FROM after SELECT *".to_string()));
+    }
+    let Some(table) = tokens.get(3) else {
+        return Err(bad("expected a table name after FROM".to_string()));
+    };
+    if !table.eq_ignore_ascii_case(KEYS_TABLE) {
+        return Err(bad(format!("unknown table: {table}")));
+    }
+    let mut offset = 0usize;
+    let mut limit = None;
+    let mut offset_seen = false;
+    let mut index = 4;
+    while let Some(token) = tokens.get(index) {
+        if token == ";" {
+            if tokens.len() != index + 1 {
+                return Err(bad("unsupported clause after ;".to_string()));
+            }
+            break;
+        }
+        match token.to_ascii_uppercase().as_str() {
+            "LIMIT" => {
+                let value = parse_page_size(tokens.get(index + 1), "LIMIT", &bad)?;
+                if limit.replace(value).is_some() {
+                    return Err(bad("duplicate LIMIT clause".to_string()));
+                }
+                index += 2;
+            }
+            "OFFSET" => {
+                let value = parse_page_size(tokens.get(index + 1), "OFFSET", &bad)?;
+                if offset_seen {
+                    return Err(bad("duplicate OFFSET clause".to_string()));
+                }
+                offset_seen = true;
+                offset = value;
+                index += 2;
+            }
+            other => return Err(bad(format!("unsupported SELECT clause: {other}"))),
+        }
+    }
+    Ok(Statement::SelectKeys { offset, limit })
+}
+
+/// Parses one LIMIT/OFFSET value as a non-negative usize.
+fn parse_page_size(
+    value: Option<&String>,
+    clause: &str,
+    bad: &dyn Fn(String) -> ServiceError,
+) -> Result<usize, ServiceError> {
+    let Some(value) = value else {
+        return Err(bad(format!("{clause} requires a value")));
+    };
+    value.parse::<usize>().map_err(|_| {
+        bad(format!(
+            "{clause} requires a non-negative integer, got {value}"
+        ))
+    })
 }
 
 fn is_read_only(verb: &str) -> bool {
@@ -397,6 +506,30 @@ impl RedisService {
         reply.map(|value| (elapsed, value))
     }
 
+    /// Executes a virtual-table SELECT over the fixed `keys` table,
+    /// paged exactly like `browse_table`: sorted keys with type and
+    /// bounded value previews, `has_more` when the page is not the
+    /// last, display rows capped at [`MAX_ROWS`].
+    async fn run_select(
+        &self,
+        offset: usize,
+        limit: Option<usize>,
+    ) -> Result<QueryResult, ServiceError> {
+        let start = Instant::now();
+        let (full_rows, total) = self.browse_page(offset, limit).await?;
+        let elapsed = start.elapsed();
+        let shown = full_rows.len().min(MAX_ROWS);
+        // Saturating: a huge parsed OFFSET must stay an empty page, not
+        // overflow the end-of-page check.
+        let has_more = offset.saturating_add(shown) < total;
+        Ok(finalize(
+            vec!["key".to_string(), "type".to_string(), "value".to_string()],
+            full_rows,
+            elapsed,
+            has_more,
+        ))
+    }
+
     /// Collects every key in the selected database via SCAN, sorts, and
     /// pages with `offset`/`limit`. Returns the page rows plus the total
     /// key count.
@@ -613,15 +746,19 @@ impl SessionService for RedisService {
     ) -> ServiceFuture<'static, QueryResult> {
         let this = self.clone();
         Box::pin(async move {
-            let tokens = parse_statement(&request.statement)?;
-            if tokens.is_empty() {
-                // e.g. a comment-only statement parses to zero tokens.
-                return Err(ServiceError::new("empty statement"));
+            match parse_statement(&request.statement)? {
+                Statement::Redis(tokens) => {
+                    if tokens.is_empty() {
+                        // e.g. a comment-only statement parses to zero tokens.
+                        return Err(ServiceError::new("empty statement"));
+                    }
+                    let (duration, reply) = this.run_command(&tokens).await?;
+                    let (columns, full_rows) = reply_rows(&reply);
+                    let truncated = full_rows.len() > MAX_ROWS;
+                    Ok(finalize(columns, full_rows, duration, truncated))
+                }
+                Statement::SelectKeys { offset, limit } => this.run_select(offset, limit).await,
             }
-            let (duration, reply) = this.run_command(&tokens).await?;
-            let (columns, full_rows) = reply_rows(&reply);
-            let truncated = full_rows.len() > MAX_ROWS;
-            Ok(finalize(columns, full_rows, duration, truncated))
         })
     }
 
@@ -632,21 +769,28 @@ impl SessionService for RedisService {
     ) -> ServiceFuture<'static, QueryResult> {
         let this = self.clone();
         Box::pin(async move {
-            let tokens = parse_statement(&request.statement)?;
-            if tokens.is_empty() {
-                // e.g. a comment-only statement parses to zero tokens.
-                return Err(ServiceError::new("empty statement"));
+            match parse_statement(&request.statement)? {
+                // A virtual-table SELECT only issues read commands over
+                // the keys browse, so it is allowed on the read-only
+                // path regardless of the allowlist.
+                Statement::SelectKeys { offset, limit } => this.run_select(offset, limit).await,
+                Statement::Redis(tokens) => {
+                    if tokens.is_empty() {
+                        // e.g. a comment-only statement parses to zero tokens.
+                        return Err(ServiceError::new("empty statement"));
+                    }
+                    let verb = tokens[0].to_ascii_uppercase();
+                    if !is_read_only(&verb) {
+                        return Err(ServiceError::new(format!(
+                            "read-only: {verb} is not allowed"
+                        )));
+                    }
+                    let (duration, reply) = this.run_command(&tokens).await?;
+                    let (columns, full_rows) = reply_rows(&reply);
+                    let truncated = full_rows.len() > MAX_ROWS;
+                    Ok(finalize(columns, full_rows, duration, truncated))
+                }
             }
-            let verb = tokens[0].to_ascii_uppercase();
-            if !is_read_only(&verb) {
-                return Err(ServiceError::new(format!(
-                    "read-only: {verb} is not allowed"
-                )));
-            }
-            let (duration, reply) = this.run_command(&tokens).await?;
-            let (columns, full_rows) = reply_rows(&reply);
-            let truncated = full_rows.len() > MAX_ROWS;
-            Ok(finalize(columns, full_rows, duration, truncated))
         })
     }
 
@@ -832,17 +976,7 @@ impl SessionService for RedisService {
             }
             let offset = request.options.offset.unwrap_or(0) as usize;
             let limit = request.options.limit.map(|l| l as usize);
-            let start = Instant::now();
-            let (full_rows, total) = this.browse_page(offset, limit).await?;
-            let elapsed = start.elapsed();
-            let shown = full_rows.len().min(MAX_ROWS);
-            let has_more = offset + shown < total;
-            Ok(finalize(
-                vec!["key".to_string(), "type".to_string(), "value".to_string()],
-                full_rows,
-                elapsed,
-                has_more,
-            ))
+            this.run_select(offset, limit).await
         })
     }
 
@@ -1032,11 +1166,17 @@ mod tests {
     fn parse_statement_accepts_shell_quoting() {
         assert_eq!(
             parse_statement("SET key \"hello world\"").unwrap(),
-            vec!["SET", "key", "hello world"]
+            Statement::Redis(vec!["SET".into(), "key".into(), "hello world".into()])
         );
         assert_eq!(
             parse_statement("GET 'single quoted'").unwrap(),
-            vec!["GET", "single quoted"]
+            Statement::Redis(vec!["GET".into(), "single quoted".into()])
+        );
+        // A native Redis SELECT (database switch) is not a virtual-table
+        // query and stays on the Redis path.
+        assert_eq!(
+            parse_statement("SELECT 2").unwrap(),
+            Statement::Redis(vec!["SELECT".into(), "2".into()])
         );
     }
 
@@ -1050,7 +1190,89 @@ mod tests {
         }
         // Comment-only statements parse to zero tokens: execute must
         // reject them rather than indexing an empty vec.
-        assert_eq!(parse_statement("# comment").unwrap(), Vec::<String>::new());
+        assert_eq!(
+            parse_statement("# comment").unwrap(),
+            Statement::Redis(Vec::<String>::new())
+        );
+    }
+
+    #[test]
+    fn parse_statement_routes_virtual_table_selects() {
+        // The exact host-generated browse statement, quoted and bare.
+        assert_eq!(
+            parse_statement(r#"SELECT * FROM "keys" LIMIT 25 OFFSET 0"#).unwrap(),
+            Statement::SelectKeys {
+                offset: 0,
+                limit: Some(25)
+            }
+        );
+        assert_eq!(
+            parse_statement("SELECT * FROM keys").unwrap(),
+            Statement::SelectKeys {
+                offset: 0,
+                limit: None
+            }
+        );
+        // Case-insensitive keywords, OFFSET before LIMIT, trailing
+        // semicolon, and zero paging values all parse.
+        assert_eq!(
+            parse_statement("select * from keys offset 5 limit 10;").unwrap(),
+            Statement::SelectKeys {
+                offset: 5,
+                limit: Some(10)
+            }
+        );
+        assert_eq!(
+            parse_statement("SELECT * FROM \"keys\" LIMIT 0 OFFSET 0").unwrap(),
+            Statement::SelectKeys {
+                offset: 0,
+                limit: Some(0)
+            }
+        );
+    }
+
+    #[test]
+    fn parse_statement_rejects_malformed_selects() {
+        // Unmatched quoting anywhere in the statement stays a shell
+        // quoting error, exactly like native commands.
+        for bad in [
+            r#"SELECT * FROM "keys"#,
+            "SELECT * FROM 'keys LIMIT 1",
+            "SELECT * FROM keys LIMIT \"25",
+        ] {
+            let err = parse_statement(bad).expect_err("unclosed quote must fail");
+            assert!(
+                err.message.contains("missing closing quote"),
+                "statement {bad:?}: {}",
+                err.message
+            );
+        }
+        // Well-formed shell syntax but outside the virtual-table grammar.
+        for (bad, expected) in [
+            ("SELECT *", "expected FROM"),
+            ("SELECT * FROM", "table name"),
+            (r#"SELECT * FROM "nope""#, "unknown table"),
+            ("SELECT * FROM keys LIMIT", "LIMIT requires a value"),
+            ("SELECT * FROM keys LIMIT -1", "non-negative integer"),
+            ("SELECT * FROM keys LIMIT 1 LIMIT 2", "duplicate LIMIT"),
+            ("SELECT * FROM keys OFFSET 1 OFFSET 0", "duplicate OFFSET"),
+            (
+                "SELECT * FROM keys WHERE 1 = 1",
+                "unsupported SELECT clause",
+            ),
+            // A terminator glued to a non-final token cannot hide
+            // trailing clauses.
+            ("SELECT * FROM keys LIMIT 1; DROP", "non-negative integer"),
+            ("SELECT * FROM keys; LIMIT 1", "unknown table"),
+            ("SELECT * FROM keys LIMIT 1 ; DROP", "unsupported clause"),
+        ] {
+            let err = parse_statement(bad).expect_err("must be rejected");
+            assert!(
+                err.message.contains(expected),
+                "statement {bad:?}: expected {expected:?}, got {}",
+                err.message
+            );
+        }
     }
 
     #[test]
