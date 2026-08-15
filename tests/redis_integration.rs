@@ -144,6 +144,46 @@ async fn row_write_ok(svc: &dyn SessionService, request: RowWriteRequest) -> u64
         .rows_affected
 }
 
+/// Runs a row write and returns `(rows_affected, statement)`, where
+/// `statement` is the native Redis command the host logs for it.
+async fn row_write_statement(svc: &dyn SessionService, request: RowWriteRequest) -> (u64, String) {
+    let response = row_write(svc, request)
+        .await
+        .unwrap_or_else(|e| panic!("row_write failed: {e:?}"));
+    (response.result.rows_affected, response.result.statement)
+}
+
+/// Asserts an update statement is the exact EVAL of the shared atomic
+/// script with the given keys and arguments: shell-parseable into
+/// `EVAL <script> 1 <key> <dst> <want> <expected> <new_value>` with the
+/// real atomic script embedded, never a simpler substitute whose
+/// effects (e.g. overwriting a colliding destination) would differ.
+fn assert_update_statement(
+    statement: &str,
+    key: &str,
+    dst: &str,
+    want: &str,
+    expected: &str,
+    new_value: &str,
+) {
+    assert!(statement.starts_with("EVAL "), "statement: {statement:?}");
+    let tokens = shell_words::split(statement).expect("statement must be shell-parseable");
+    assert_eq!(tokens.len(), 8, "statement: {statement:?}");
+    assert_eq!(tokens[0], "EVAL", "statement: {statement:?}");
+    assert!(
+        tokens[1].contains("local src = KEYS[1]")
+            && tokens[1].contains("redis.call('RENAME', src, dst)"),
+        "embedded script must be the shared atomic update script, got: {}",
+        tokens[1]
+    );
+    assert_eq!(tokens[2], "1", "statement: {statement:?}");
+    assert_eq!(
+        &tokens[3..],
+        [key, dst, want, expected, new_value],
+        "statement: {statement:?}"
+    );
+}
+
 #[tokio::test]
 async fn open_reports_redis_info_and_selects_the_database() {
     let Some(url) = redis_url() else {
@@ -793,7 +833,10 @@ async fn row_write_insert_creates_strings_and_rejects_collisions() {
     let (_info, svc) = open_session(&url).await;
     exec_ok(&*svc, "FLUSHDB").await;
 
-    assert_eq!(row_write_ok(&*svc, insert_req("rw-ins", "v1")).await, 1);
+    assert_eq!(
+        row_write_statement(&*svc, insert_req("rw-ins", "v1")).await,
+        (1, "SET rw-ins v1 NX".to_string())
+    );
     let got = exec_ok(&*svc, "GET rw-ins").await;
     assert_eq!(got.rows, vec![vec![Some("v1".to_string())]]);
     let type_ = exec_ok(&*svc, "TYPE rw-ins").await;
@@ -807,13 +850,23 @@ async fn row_write_insert_creates_strings_and_rejects_collisions() {
         .as_mut()
         .unwrap()
         .push(cell("type", "string"));
-    assert_eq!(row_write_ok(&*svc, with_type).await, 1);
+    assert_eq!(
+        row_write_statement(&*svc, with_type).await,
+        (1, "SET rw-ins2 v2 NX".to_string())
+    );
     let mut blank_type = insert_req("rw-ins3", "v3");
     blank_type.values.as_mut().unwrap().push(cell("type", ""));
-    assert_eq!(row_write_ok(&*svc, blank_type).await, 1);
+    assert_eq!(
+        row_write_statement(&*svc, blank_type).await,
+        (1, "SET rw-ins3 v3 NX".to_string())
+    );
     let mut no_value = insert_req("rw-ins4", "");
     no_value.values.as_mut().unwrap().pop();
-    assert_eq!(row_write_ok(&*svc, no_value).await, 1);
+    // The empty value stays an explicit empty token on the wire.
+    assert_eq!(
+        row_write_statement(&*svc, no_value).await,
+        (1, "SET rw-ins4 '' NX".to_string())
+    );
     assert_eq!(
         exec_ok(&*svc, "GET rw-ins4").await.rows,
         vec![vec![Some(String::new())]]
@@ -863,20 +916,20 @@ async fn row_write_update_edits_strings_and_renames() {
     exec_ok(&*svc, "SET rw-up v").await;
 
     // Value edit: the complete string is replaced with SET.
-    assert_eq!(
-        row_write_ok(&*svc, update_req("rw-up", vec![cell("value", "edited")])).await,
-        1
-    );
+    let (affected, statement) =
+        row_write_statement(&*svc, update_req("rw-up", vec![cell("value", "edited")])).await;
+    assert_eq!(affected, 1);
+    assert_update_statement(&statement, "rw-up", "rw-up", "1", "v", "edited");
     let got = exec_ok(&*svc, "GET rw-up").await;
     assert_eq!(got.rows, vec![vec![Some("edited".to_string())]]);
 
     // The guard is on the current value, not the new one: a 400-rune
     // explicit replacement of a short string is an accepted edit.
     let huge_new = "z".repeat(400);
-    assert_eq!(
-        row_write_ok(&*svc, update_req("rw-up", vec![cell("value", &huge_new)])).await,
-        1
-    );
+    let (affected, statement) =
+        row_write_statement(&*svc, update_req("rw-up", vec![cell("value", &huge_new)])).await;
+    assert_eq!(affected, 1);
+    assert_update_statement(&statement, "rw-up", "rw-up", "1", "edited", &huge_new);
     let got = exec_ok(&*svc, "GET rw-up").await;
     assert_eq!(got.untruncated_rows, vec![vec![Some(huge_new)]]);
 
@@ -887,10 +940,10 @@ async fn row_write_update_edits_strings_and_renames() {
     assert!(err.message.contains("rw-missing"), "{}", err.message);
 
     // Rename: the `key` column change moves the existing key.
-    assert_eq!(
-        row_write_ok(&*svc, update_req("rw-up", vec![cell("key", "rw-renamed")])).await,
-        1
-    );
+    let (affected, statement) =
+        row_write_statement(&*svc, update_req("rw-up", vec![cell("key", "rw-renamed")])).await;
+    assert_eq!(affected, 1);
+    assert_update_statement(&statement, "rw-up", "rw-renamed", "0", "", "");
     assert_eq!(
         exec_ok(&*svc, "EXISTS rw-up").await.rows,
         vec![vec![Some("0".to_string())]]
@@ -917,21 +970,20 @@ async fn row_write_update_edits_strings_and_renames() {
     );
 
     // Same-name rename is a successful no-op.
-    assert_eq!(
-        row_write_ok(
-            &*svc,
-            update_req("rw-renamed", vec![cell("key", "rw-renamed")])
-        )
-        .await,
-        1
-    );
+    let (affected, statement) = row_write_statement(
+        &*svc,
+        update_req("rw-renamed", vec![cell("key", "rw-renamed")]),
+    )
+    .await;
+    assert_eq!(affected, 1);
+    assert_update_statement(&statement, "rw-renamed", "rw-renamed", "0", "", "");
 
     // Rename works on non-string types: the type travels unchanged.
     exec_ok(&*svc, "HSET rw-h f v").await;
-    assert_eq!(
-        row_write_ok(&*svc, update_req("rw-h", vec![cell("key", "rw-h2")])).await,
-        1
-    );
+    let (affected, statement) =
+        row_write_statement(&*svc, update_req("rw-h", vec![cell("key", "rw-h2")])).await;
+    assert_eq!(affected, 1);
+    assert_update_statement(&statement, "rw-h", "rw-h2", "0", "", "");
     assert_eq!(
         exec_ok(&*svc, "TYPE rw-h2").await.rows,
         vec![vec![Some("hash".to_string())]]
@@ -995,10 +1047,10 @@ async fn row_write_update_rejects_unsafe_value_edits_without_mutation() {
     // Exactly 300 runes is representable without truncation: editable.
     let exact = "y".repeat(300);
     exec_ok(&*svc, &format!("SET rw-exact {exact}")).await;
-    assert_eq!(
-        row_write_ok(&*svc, update_req("rw-exact", vec![cell("value", "ok")])).await,
-        1
-    );
+    let (affected, statement) =
+        row_write_statement(&*svc, update_req("rw-exact", vec![cell("value", "ok")])).await;
+    assert_eq!(affected, 1);
+    assert_update_statement(&statement, "rw-exact", "rw-exact", "1", &exact, "ok");
     assert_eq!(
         exec_ok(&*svc, "GET rw-exact").await.rows,
         vec![vec![Some("ok".to_string())]]
@@ -1050,14 +1102,13 @@ async fn row_write_update_rename_plus_value_is_atomic() {
 
     // Rename and value change apply together: one row, moved and replaced.
     exec_ok(&*svc, "SET rw-src old").await;
-    assert_eq!(
-        row_write_ok(
-            &*svc,
-            update_req("rw-src", vec![cell("key", "rw-dst"), cell("value", "new")])
-        )
-        .await,
-        1
-    );
+    let (affected, statement) = row_write_statement(
+        &*svc,
+        update_req("rw-src", vec![cell("key", "rw-dst"), cell("value", "new")]),
+    )
+    .await;
+    assert_eq!(affected, 1);
+    assert_update_statement(&statement, "rw-src", "rw-dst", "1", "old", "new");
     assert_eq!(
         exec_ok(&*svc, "EXISTS rw-src").await.rows,
         vec![vec![Some("0".to_string())]]
@@ -1124,20 +1175,139 @@ async fn row_write_delete_reports_actual_rows_affected() {
     exec_ok(&*svc, "FLUSHDB").await;
 
     exec_ok(&*svc, "SET rw-del v").await;
-    assert_eq!(row_write_ok(&*svc, delete_req("rw-del")).await, 1);
+    assert_eq!(
+        row_write_statement(&*svc, delete_req("rw-del")).await,
+        (1, "DEL rw-del".to_string())
+    );
     assert_eq!(
         exec_ok(&*svc, "EXISTS rw-del").await.rows,
         vec![vec![Some("0".to_string())]]
     );
-    // DEL's actual count: a missing key reports 0, not an error.
-    assert_eq!(row_write_ok(&*svc, delete_req("rw-del")).await, 0);
-    assert_eq!(row_write_ok(&*svc, delete_req("rw-never")).await, 0);
+    // DEL's actual count: a missing key reports 0, not an error. The
+    // statement still logs the exact DEL command.
+    assert_eq!(
+        row_write_statement(&*svc, delete_req("rw-del")).await,
+        (0, "DEL rw-del".to_string())
+    );
+    assert_eq!(
+        row_write_statement(&*svc, delete_req("rw-never")).await,
+        (0, "DEL rw-never".to_string())
+    );
 
     // An empty-string key is a valid Redis key: delete runs DEL and
-    // reports its actual count.
+    // reports its actual count, logging the empty key explicitly.
     exec_ok(&*svc, "SET \"\" empty-key-value").await;
-    assert_eq!(row_write_ok(&*svc, delete_req("")).await, 1);
+    assert_eq!(
+        row_write_statement(&*svc, delete_req("")).await,
+        (1, "DEL ''".to_string())
+    );
     assert_eq!(row_write_ok(&*svc, delete_req("")).await, 0);
+
+    svc.close();
+}
+
+#[tokio::test]
+async fn row_write_statements_are_native_replayable_commands() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+
+    // Insert: the logged command is the exact SET ... NX.
+    let (affected, insert_statement) = row_write_statement(&*svc, insert_req("user:2", "v1")).await;
+    assert_eq!(affected, 1);
+    assert_eq!(insert_statement, "SET user:2 v1 NX");
+
+    // Pure key rename user:2 -> user:3 logs an executable EVAL of the
+    // atomic script — never a generic Table/Key/Changes preview.
+    let (affected, rename_statement) =
+        row_write_statement(&*svc, update_req("user:2", vec![cell("key", "user:3")])).await;
+    assert_eq!(affected, 1);
+    assert_update_statement(&rename_statement, "user:2", "user:3", "0", "", "");
+
+    // Value-only update and combined rename + value update.
+    let (affected, value_statement) =
+        row_write_statement(&*svc, update_req("user:3", vec![cell("value", "v2")])).await;
+    assert_eq!(affected, 1);
+    assert_update_statement(&value_statement, "user:3", "user:3", "1", "v1", "v2");
+    let (affected, combined_statement) = row_write_statement(
+        &*svc,
+        update_req("user:3", vec![cell("key", "user:4"), cell("value", "v3")]),
+    )
+    .await;
+    assert_eq!(affected, 1);
+    assert_update_statement(&combined_statement, "user:3", "user:4", "1", "v2", "v3");
+
+    // Delete: the logged command is the exact DEL.
+    let (affected, delete_statement) = row_write_statement(&*svc, delete_req("user:4")).await;
+    assert_eq!(affected, 1);
+    assert_eq!(delete_statement, "DEL user:4");
+
+    // Every captured statement replays through the plugin's normal
+    // execute parser against Redis: run them in sequence from a clean
+    // database and observe the same end state each row write produced.
+    exec_ok(&*svc, "FLUSHDB").await;
+    exec_ok(&*svc, &insert_statement).await;
+    assert_eq!(
+        exec_ok(&*svc, "GET user:2").await.rows,
+        vec![vec![Some("v1".to_string())]]
+    );
+    exec_ok(&*svc, &rename_statement).await;
+    assert_eq!(
+        exec_ok(&*svc, "EXISTS user:2").await.rows,
+        vec![vec![Some("0".to_string())]]
+    );
+    assert_eq!(
+        exec_ok(&*svc, "GET user:3").await.rows,
+        vec![vec![Some("v1".to_string())]]
+    );
+    exec_ok(&*svc, &value_statement).await;
+    assert_eq!(
+        exec_ok(&*svc, "GET user:3").await.rows,
+        vec![vec![Some("v2".to_string())]]
+    );
+    exec_ok(&*svc, &combined_statement).await;
+    assert_eq!(
+        exec_ok(&*svc, "EXISTS user:3").await.rows,
+        vec![vec![Some("0".to_string())]]
+    );
+    assert_eq!(
+        exec_ok(&*svc, "GET user:4").await.rows,
+        vec![vec![Some("v3".to_string())]]
+    );
+    exec_ok(&*svc, &delete_statement).await;
+    assert_eq!(
+        exec_ok(&*svc, "EXISTS user:4").await.rows,
+        vec![vec![Some("0".to_string())]]
+    );
+
+    // Hostile tokens: the statement the host logs round-trips through
+    // the plugin's own parser and replays verbatim, including spaces,
+    // quotes, backslashes, and a newline.
+    let (affected, hostile_statement) =
+        row_write_statement(&*svc, insert_req("user:5 a", "it's \"quoted\"\nline\\end")).await;
+    assert_eq!(affected, 1);
+    assert_eq!(
+        shell_words::split(&hostile_statement).unwrap(),
+        vec![
+            "SET".to_string(),
+            "user:5 a".to_string(),
+            "it's \"quoted\"\nline\\end".to_string(),
+            "NX".to_string(),
+        ]
+    );
+    validate(&*svc, &hostile_statement)
+        .await
+        .expect("hostile statement must pass the plugin's own parser");
+    exec_ok(&*svc, "FLUSHDB").await;
+    exec_ok(&*svc, &hostile_statement).await;
+    assert_eq!(
+        exec_ok(&*svc, "GET \"user:5 a\"").await.rows,
+        vec![vec![Some("it's \"quoted\"\nline\\end".to_string())]]
+    );
 
     svc.close();
 }

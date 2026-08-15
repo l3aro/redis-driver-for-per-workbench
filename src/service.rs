@@ -719,6 +719,9 @@ impl SessionService for MemoryService {
             Ok(RowWriteResponse {
                 result: RowsAffected {
                     rows_affected: affected,
+                    // The in-memory double is a transport fixture, not a
+                    // real backend: no native statement to report.
+                    statement: String::new(),
                 },
             })
         })

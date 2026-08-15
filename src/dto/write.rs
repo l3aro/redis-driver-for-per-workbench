@@ -62,6 +62,12 @@ pub struct RowWriteRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RowsAffected {
     pub rows_affected: u64,
+    /// Optional backend-native, replayable command that produced this
+    /// result (e.g. `SET user:2 v NX`). The host logs it in place of the
+    /// generic preview and never executes it itself; omitted from the
+    /// wire when empty so older hosts see the prior shape.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub statement: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -99,4 +105,48 @@ pub struct DocumentWriteResponse {
     /// Set for read operations; serialized as null when unset.
     #[serde(default)]
     pub document: Option<DocumentPayload>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rows_affected_omits_empty_statement_and_round_trips() {
+        // Empty statement: the exact prior wire shape.
+        let plain = RowWriteResponse {
+            result: RowsAffected {
+                rows_affected: 2,
+                statement: String::new(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"result":{"rows_affected":2}}"#
+        );
+
+        // A non-empty statement rides inside `result` and survives a
+        // round trip.
+        let native = RowWriteResponse {
+            result: RowsAffected {
+                rows_affected: 1,
+                statement: "SET user:2 v NX".to_string(),
+            },
+        };
+        assert_eq!(
+            serde_json::to_string(&native).unwrap(),
+            r#"{"result":{"rows_affected":1,"statement":"SET user:2 v NX"}}"#
+        );
+        let back: RowWriteResponse =
+            serde_json::from_str(r#"{"result":{"rows_affected":1,"statement":"SET user:2 v NX"}}"#)
+                .unwrap();
+        assert_eq!(back, native);
+
+        // A legacy response without the key decodes with an empty
+        // statement.
+        let legacy: RowWriteResponse =
+            serde_json::from_str(r#"{"result":{"rows_affected":3}}"#).unwrap();
+        assert_eq!(legacy.result.rows_affected, 3);
+        assert!(legacy.result.statement.is_empty());
+    }
 }

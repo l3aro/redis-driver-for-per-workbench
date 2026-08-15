@@ -152,6 +152,18 @@ database; `rows_affected` reports the real count.
 - **Delete** — `DEL` the identified key; `rows_affected` is the actual
   0/1 deletion count.
 
+Every successful row write reports the **exact native Redis command that
+was executed** as the wire `statement` (the host logs it in the query log
+in place of the generic preview; it never executes the text itself).
+Inserts log `SET <key> <value> NX`, deletes log `DEL <key>`, and updates
+log `EVAL <script> 1 <key> <dst> <want> <expected> <new>` — the shared
+atomic update script with its exact keys and arguments, never a simpler
+`RENAME`/`SET` whose effects (e.g. overwriting a colliding destination)
+would differ from the guarded operation. Every token is shell-quoted, so
+the logged entry can be pasted into Workbench Execute and replayed
+verbatim; keys and values containing spaces, quotes, backslashes, or
+newlines survive the round trip.
+
 In the current host the row forms live on the Browse tab, which cannot
 open `keys` because of the schema-sidebar limitation below, so the TUI
 path for writes is still the SQL editor (`SET`/`DEL`/`RENAME`). The

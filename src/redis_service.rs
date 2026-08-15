@@ -221,6 +221,61 @@ fn is_read_only(verb: &str) -> bool {
 
 // --- row writes ---------------------------------------------------------
 
+/// The atomic update script, shared verbatim by execution and the
+/// reported EVAL statement so the two cannot drift. Re-checks existence,
+/// type, and destination inside Lua, compares the validated current
+/// value, and performs rename + SET together so a concurrent change
+/// aborts the whole update instead of partially applying it.
+const UPDATE_SCRIPT: &str = r#"local src = KEYS[1]
+local dst = ARGV[1]
+local want_value = ARGV[2]
+local expected = ARGV[3]
+local new_value = ARGV[4]
+if redis.call('EXISTS', src) == 0 then
+  return redis.error_reply('key not found: ' .. src)
+end
+if want_value == '1' then
+  local t = redis.call('TYPE', src).ok
+  if t ~= 'string' then
+    return redis.error_reply('cannot edit value: ' .. src .. ' is not a string (type ' .. t .. ')')
+  end
+  if redis.call('GET', src) ~= expected then
+    return redis.error_reply('cannot edit value: ' .. src .. ' changed concurrently')
+  end
+end
+if dst ~= src and redis.call('EXISTS', dst) == 1 then
+  return redis.error_reply('destination key already exists: ' .. dst)
+end
+if dst ~= src then
+  redis.call('RENAME', src, dst)
+end
+if want_value == '1' then
+  redis.call('SET', dst, new_value)
+end
+return 1
+"#;
+
+/// Renders one native Redis command line from its raw tokens with the
+/// same shell quoting [`parse_statement`] decodes, so the statement
+/// round-trips through the plugin's own parser to exactly the executed
+/// command. Empty tokens are quoted as `''`: `shell_words::quote` alone
+/// leaves them bare, which would collapse an empty key/argument into the
+/// neighbouring token when split back. Row writes return this as the
+/// wire `statement` for the host's query log.
+fn render_command(tokens: &[&str]) -> String {
+    tokens
+        .iter()
+        .map(|token| {
+            if token.is_empty() {
+                "''".to_string()
+            } else {
+                shell_words::quote(token).into_owned()
+            }
+        })
+        .collect::<Vec<String>>()
+        .join(" ")
+}
+
 /// One parsed row-write request over the virtual `keys` table, fully
 /// validated against the fixed schema before any Redis I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -703,13 +758,13 @@ impl RedisService {
 
     /// Forwards one parsed statement as a raw `redis::Cmd` and returns
     /// the elapsed duration alongside the reply.
-    async fn run_command(
+    async fn run_command<S: AsRef<str>>(
         &self,
-        tokens: &[String],
+        tokens: &[S],
     ) -> Result<(Duration, redis::Value), ServiceError> {
         let mut cmd = redis::Cmd::new();
         for token in tokens {
-            cmd.arg(token.as_str());
+            cmd.arg(token.as_ref());
         }
         let start = Instant::now();
         let reply = self.query::<redis::Value>(&cmd).await;
@@ -919,21 +974,31 @@ impl RedisService {
 
     // --- row writes ----------------------------------------------------
 
-    /// `DEL` one key; the actual 0/1 deletion count is the rows affected.
-    async fn delete_row(&self, key: &str) -> Result<u64, ServiceError> {
-        let deleted: i64 = self.query(redis::cmd("DEL").arg(key)).await?;
-        Ok(deleted.max(0) as u64)
+    /// `DEL` one key; the actual 0/1 deletion count is the rows
+    /// affected. Returns the count plus the exact executed command.
+    async fn delete_row(&self, key: &str) -> Result<(u64, String), ServiceError> {
+        let tokens = ["DEL", key];
+        let (_, reply) = self.run_command(&tokens).await?;
+        let deleted = match reply {
+            redis::Value::Int(count) => count.max(0) as u64,
+            other => {
+                return Err(ServiceError::new(format!(
+                    "unexpected DEL reply: {other:?}"
+                )));
+            }
+        };
+        Ok((deleted, render_command(&tokens)))
     }
 
     /// `SET key value NX`: creates the string only when the key is
     /// absent, so an explicit insert can never overwrite anything.
-    async fn insert_row(&self, key: &str, value: &str) -> Result<u64, ServiceError> {
-        let reply = self
-            .query::<redis::Value>(redis::cmd("SET").arg(key).arg(value).arg("NX"))
-            .await?;
+    /// Returns the affected count plus the exact executed command.
+    async fn insert_row(&self, key: &str, value: &str) -> Result<(u64, String), ServiceError> {
+        let tokens = ["SET", key, value, "NX"];
+        let (_, reply) = self.run_command(&tokens).await?;
         match reply {
             redis::Value::Nil => Err(ServiceError::new(format!("key already exists: {key}"))),
-            _ => Ok(1),
+            _ => Ok((1, render_command(&tokens))),
         }
     }
 
@@ -942,13 +1007,14 @@ impl RedisService {
     /// display fit, destination availability — then one Lua script
     /// re-checks the invariants and performs rename + SET together, so a
     /// concurrent change aborts the whole update instead of partially
-    /// applying it.
+    /// applying it. Returns the affected count plus the exact executed
+    /// EVAL statement, rendered from the same script and arguments.
     async fn update_row(
         &self,
         key: &str,
         rename_to: Option<&str>,
         value: Option<&str>,
-    ) -> Result<u64, ServiceError> {
+    ) -> Result<(u64, String), ServiceError> {
         let destination = rename_to.unwrap_or(key);
         let mut expected: Option<String> = None;
         if value.is_some() {
@@ -999,39 +1065,27 @@ impl RedisService {
                 )));
             }
         }
-        // One atomic script: existence, type, and destination are
-        // re-checked inside; the validated current value is compared so a
-        // value changed by another client after validation aborts the
-        // whole update. Rename and SET never split across commands.
-        let script = "\
-local src = KEYS[1]
-local dst = ARGV[1]
-local want_value = ARGV[2]
-local expected = ARGV[3]
-local new_value = ARGV[4]
-if redis.call('EXISTS', src) == 0 then
-  return redis.error_reply('key not found: ' .. src)
-end
-if want_value == '1' then
-  local t = redis.call('TYPE', src).ok
-  if t ~= 'string' then
-    return redis.error_reply('cannot edit value: ' .. src .. ' is not a string (type ' .. t .. ')')
-  end
-  if redis.call('GET', src) ~= expected then
-    return redis.error_reply('cannot edit value: ' .. src .. ' changed concurrently')
-  end
-end
-if dst ~= src and redis.call('EXISTS', dst) == 1 then
-  return redis.error_reply('destination key already exists: ' .. dst)
-end
-if dst ~= src then
-  redis.call('RENAME', src, dst)
-end
-if want_value == '1' then
-  redis.call('SET', dst, new_value)
-end
-return 1
-";
+        // One atomic script (shared with the reported statement):
+        // existence, type, and destination are re-checked inside; the
+        // validated current value is compared so a value changed by
+        // another client after validation aborts the whole update.
+        // Rename and SET never split across commands.
+        let args: [&str; 4] = [
+            destination,
+            if value.is_some() { "1" } else { "0" },
+            expected.as_deref().unwrap_or(""),
+            value.unwrap_or(""),
+        ];
+        let statement = render_command(&[
+            "EVAL",
+            UPDATE_SCRIPT,
+            "1",
+            key,
+            args[0],
+            args[1],
+            args[2],
+            args[3],
+        ]);
         if self.closed.load(Ordering::Relaxed) {
             return Err(ServiceError::new("session closed"));
         }
@@ -1039,16 +1093,16 @@ return 1
         let conn = guard
             .as_mut()
             .ok_or_else(|| ServiceError::new("session closed"))?;
-        let affected: i64 = redis::Script::new(script)
+        let affected: i64 = redis::Script::new(UPDATE_SCRIPT)
             .key(key)
-            .arg(destination)
-            .arg(if value.is_some() { "1" } else { "0" })
-            .arg(expected.as_deref().unwrap_or(""))
-            .arg(value.unwrap_or(""))
+            .arg(args[0])
+            .arg(args[1])
+            .arg(args[2])
+            .arg(args[3])
             .invoke_async(conn)
             .await
             .map_err(|e| ServiceError::new(format!("redis: {e}")))?;
-        Ok(affected.max(0) as u64)
+        Ok((affected.max(0) as u64, statement))
     }
 }
 
@@ -1332,7 +1386,7 @@ impl SessionService for RedisService {
     ) -> ServiceFuture<'static, RowWriteResponse> {
         let this = self.clone();
         Box::pin(async move {
-            let rows_affected = match parse_row_write(&request)? {
+            let (rows_affected, statement) = match parse_row_write(&request)? {
                 RowWrite::Delete { key } => this.delete_row(&key).await?,
                 RowWrite::Update {
                     key,
@@ -1345,7 +1399,10 @@ impl SessionService for RedisService {
                 RowWrite::Insert { key, value } => this.insert_row(&key, &value).await?,
             };
             Ok(RowWriteResponse {
-                result: RowsAffected { rows_affected },
+                result: RowsAffected {
+                    rows_affected,
+                    statement,
+                },
             })
         })
     }
@@ -2103,5 +2160,98 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    #[test]
+    fn render_command_round_trips_hostile_tokens() {
+        let hostile = [
+            "hello world",
+            "it's",
+            "say \"hi\"",
+            r"back\slash",
+            "line1\nline2",
+            "tab\there",
+            "",
+            "$HOME",
+            "`cmd`",
+            "*?[#~=%",
+            "päth/ünicode ✓",
+        ];
+        let statement = render_command(&hostile);
+        // The exact executed tokens survive the plugin's own parser...
+        assert_eq!(
+            parse_statement(&statement).unwrap(),
+            Statement::Redis(hostile.iter().map(|s| s.to_string()).collect()),
+            "statement: {statement:?}"
+        );
+        // ...and plain shell_words splitting agrees token for token.
+        assert_eq!(
+            shell_words::split(&statement).unwrap(),
+            hostile,
+            "statement: {statement:?}"
+        );
+    }
+
+    #[test]
+    fn render_command_quotes_empty_tokens_explicitly() {
+        // `SET '' v NX`: an empty key must stay an empty token. Bare
+        // quoting would collapse it into the neighbouring argument and
+        // silently change the executed command.
+        assert_eq!(render_command(&["SET", "", "v", "NX"]), "SET '' v NX");
+        assert_eq!(
+            parse_statement("SET '' v NX").unwrap(),
+            Statement::Redis(vec!["SET".into(), String::new(), "v".into(), "NX".into()])
+        );
+        assert_eq!(render_command(&["DEL", ""]), "DEL ''");
+    }
+
+    #[test]
+    fn render_command_leaves_simple_tokens_bare() {
+        assert_eq!(
+            render_command(&["SET", "user:2", "v1", "NX"]),
+            "SET user:2 v1 NX"
+        );
+        assert_eq!(render_command(&["DEL", "user:2"]), "DEL user:2");
+    }
+
+    #[test]
+    fn update_statements_are_exact_eval_of_the_shared_script() {
+        // A pure rename reports the exact EVAL of the atomic script, not
+        // a plain RENAME whose overwrite semantics would differ.
+        let statement =
+            render_command(&["EVAL", UPDATE_SCRIPT, "1", "user:2", "user:3", "0", "", ""]);
+        assert!(statement.starts_with("EVAL '"), "statement: {statement:?}");
+        assert_eq!(
+            shell_words::split(&statement).unwrap(),
+            vec![
+                "EVAL".to_string(),
+                UPDATE_SCRIPT.to_string(),
+                "1".to_string(),
+                "user:2".to_string(),
+                "user:3".to_string(),
+                "0".to_string(),
+                String::new(),
+                String::new(),
+            ]
+        );
+        // Hostile rename + value args survive the round trip through the
+        // plugin's own parser.
+        let hostile = [
+            "EVAL",
+            UPDATE_SCRIPT,
+            "1",
+            "user:2",
+            "user 3's \"new\"\nname",
+            "1",
+            "old 'value'",
+            r"back\slash",
+        ];
+        let statement = render_command(&hostile);
+        assert_eq!(
+            parse_statement(&statement).unwrap(),
+            Statement::Redis(hostile.iter().map(|s| s.to_string()).collect()),
+            "statement: {statement:?}"
+        );
+        assert_eq!(shell_words::split(&statement).unwrap(), hostile);
     }
 }
