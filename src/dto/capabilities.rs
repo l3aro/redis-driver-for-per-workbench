@@ -64,6 +64,23 @@ pub struct WriteCapabilities {
     pub document: Option<DocumentWriteCapability>,
 }
 
+/// How the query editor presents this driver's statements: the language
+/// name, the editor tab label, the input placeholder, an optional lexer
+/// hint, and optional example statements the driver's parser already
+/// accepts. `name`, `editor_label`, and `placeholder` must be nonblank;
+/// `lexer` and `examples` are omitted on the wire when absent (Redis
+/// advertises no lexer: statements are commands, not SQL).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryLanguage {
+    pub name: String,
+    pub editor_label: String,
+    pub placeholder: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lexer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub examples: Option<Vec<String>>,
+}
+
 /// Driver advertisement returned by `perk/v1/initialize`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Capabilities {
@@ -75,6 +92,10 @@ pub struct Capabilities {
     /// Omitted for target-only drivers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub form: Option<FormSpec>,
+    /// Omitted when the driver does not advertise one (the host then
+    /// falls back to the legacy SQL default).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub query_language: Option<QueryLanguage>,
     pub write_capabilities: WriteCapabilities,
 }
 

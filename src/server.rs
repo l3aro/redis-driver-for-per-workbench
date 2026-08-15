@@ -25,14 +25,19 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
 use crate::dto::capabilities::{
-    Capabilities, FormField, FormSpec, TargetPattern, WriteCapabilities,
+    Capabilities, FormField, FormSpec, QueryLanguage, TargetPattern, WriteCapabilities,
 };
 use crate::dto::request::{CancelRequest, CloseRequest, OpenRequest, OpenResult};
 use crate::protocol::{
-    ERR_INVALID_PARAMS, ERR_INVALID_REQUEST, ERR_METHOD_NOT_FOUND, ProtocolError, Response,
-    ServerError, frame_bytes, read_frame,
+    ERR_INVALID_PARAMS, ERR_INVALID_REQUEST, ERR_METHOD_NOT_FOUND, ErrorKind, ErrorObject,
+    ProtocolError, Response, ServerError, frame_bytes, read_frame,
 };
 use crate::service::{ServiceError, SessionFactory, SessionService};
+
+/// The plugin identity carried in every error-provenance `data` object.
+/// The host treats it as advisory: the identity retained from a
+/// successful `perk/v1/initialize` handshake overrides it.
+const PLUGIN: &str = "redis";
 
 /// The 20 mandatory session methods.
 const SESSION_METHODS: [&str; 20] = [
@@ -57,6 +62,23 @@ const SESSION_METHODS: [&str; 20] = [
     "perk/v1/add_column",
     "perk/v1/browse_table",
 ];
+
+/// The query editor advertisement: Redis commands, no SQL lexer. Every
+/// example below is accepted by the plugin's own parser.
+fn redis_query_language() -> QueryLanguage {
+    QueryLanguage {
+        name: "Redis".to_string(),
+        editor_label: "Command".to_string(),
+        placeholder: "Enter a Redis command, e.g. GET user:1".to_string(),
+        lexer: None,
+        examples: Some(vec![
+            "PING".to_string(),
+            "GET user:1".to_string(),
+            "SET user:1 v1 NX".to_string(),
+            r#"SELECT * FROM "keys" LIMIT 25"#.to_string(),
+        ]),
+    }
+}
 
 /// The Redis plugin advertisement for the perk/v1 handshake.
 pub fn redis_capabilities() -> Capabilities {
@@ -128,6 +150,7 @@ pub fn redis_capabilities() -> Capabilities {
                 },
             ],
         }),
+        query_language: Some(redis_query_language()),
         write_capabilities: WriteCapabilities {
             row_writer: true,
             document: None,
@@ -226,7 +249,7 @@ impl Server {
         };
         let jsonrpc = obj.get("jsonrpc").and_then(Value::as_str);
         let id = obj.get("id").cloned();
-        let method = obj.get("method").and_then(Value::as_str);
+        let method = obj.get("method").and_then(Value::as_str).unwrap_or("");
         let params = obj.get("params").cloned();
         let is_request = id.is_some();
 
@@ -236,10 +259,12 @@ impl Server {
             None => None,
             Some(Value::Number(n)) if n.is_i64() || n.is_u64() => Some(n.clone()),
             Some(_) => {
-                sink.send(frame_bytes(&Response::error(
+                sink.send(frame_bytes(&direct_error(
                     None,
                     ERR_INVALID_REQUEST,
                     "invalid request: id must be an integer",
+                    method,
+                    ErrorKind::Validation,
                 )));
                 return Ok(());
             }
@@ -247,25 +272,29 @@ impl Server {
 
         if jsonrpc != Some("2.0") {
             if is_request {
-                sink.send(frame_bytes(&Response::error(
+                sink.send(frame_bytes(&direct_error(
                     request_id,
                     ERR_INVALID_REQUEST,
                     "invalid request: jsonrpc must be \"2.0\"",
+                    method,
+                    ErrorKind::Validation,
                 )));
             }
             return Ok(());
         }
 
-        let Some(method) = method else {
+        if method.is_empty() {
             if is_request {
-                sink.send(frame_bytes(&Response::error(
+                sink.send(frame_bytes(&direct_error(
                     request_id,
                     ERR_INVALID_REQUEST,
                     "invalid request: missing method",
+                    method,
+                    ErrorKind::Validation,
                 )));
             }
             return Ok(());
-        };
+        }
 
         // Notifications: only perk/v1/cancel is defined; others are ignored.
         if !is_request {
@@ -282,39 +311,47 @@ impl Server {
             if method == "perk/v1/initialize" {
                 self.handle_initialize(params, id, sink);
             } else {
-                sink.send(frame_bytes(&Response::error(
+                sink.send(frame_bytes(&direct_error(
                     Some(id),
                     ERR_INVALID_REQUEST,
                     "request before initialization",
+                    method,
+                    ErrorKind::Validation,
                 )));
             }
             return Ok(());
         }
 
         match method {
-            "perk/v1/initialize" => sink.send(frame_bytes(&Response::error(
+            "perk/v1/initialize" => sink.send(frame_bytes(&direct_error(
                 Some(id),
                 ERR_INVALID_REQUEST,
                 "initialize already called",
+                method,
+                ErrorKind::Validation,
             ))),
             "perk/v1/build_target" => self.handle_build_target(params, id, sink),
             "perk/v1/open" => self.handle_open(params, id, sink).await,
             "perk/v1/close" => self.handle_close(params, id, sink).await,
             "perk/v1/row_write" => self.spawn_session_method(method, params, id, sink).await,
             "perk/v1/document_write" => {
-                sink.send(frame_bytes(&Response::error(
+                sink.send(frame_bytes(&direct_error(
                     Some(id),
                     ERR_METHOD_NOT_FOUND,
                     "method not found: not advertised by write_capabilities",
+                    method,
+                    ErrorKind::Unsupported,
                 )));
             }
             _ if SESSION_METHODS.contains(&method) => {
                 self.spawn_session_method(method, params, id, sink).await;
             }
-            _ => sink.send(frame_bytes(&Response::error(
+            _ => sink.send(frame_bytes(&direct_error(
                 Some(id),
                 ERR_METHOD_NOT_FOUND,
                 format!("method not found: {method}"),
+                method,
+                ErrorKind::Unsupported,
             ))),
         }
         Ok(())
@@ -330,18 +367,22 @@ impl Server {
         }
         let parsed = params.and_then(|p| serde_json::from_value::<InitializeParams>(p).ok());
         let Some(parsed) = parsed else {
-            sink.send(frame_bytes(&Response::error(
+            sink.send(frame_bytes(&direct_error(
                 Some(id),
                 ERR_INVALID_PARAMS,
                 "invalid params: initialize requires {\"protocol_version\":1,\"workbench_version\":string}",
+                "perk/v1/initialize",
+                ErrorKind::Validation,
             )));
             return;
         };
         if parsed.protocol_version != 1 {
-            sink.send(frame_bytes(&Response::error(
+            sink.send(frame_bytes(&direct_error(
                 Some(id),
                 ERR_INVALID_REQUEST,
                 "unsupported protocol_version",
+                "perk/v1/initialize",
+                ErrorKind::Validation,
             )));
             return;
         }
@@ -367,10 +408,12 @@ impl Server {
         let values = match decode_params::<crate::dto::capabilities::FormValues>(params) {
             Ok(v) => v,
             Err(message) => {
-                sink.send(frame_bytes(&Response::error(
+                sink.send(frame_bytes(&direct_error(
                     Some(id),
                     ERR_INVALID_PARAMS,
                     message,
+                    "perk/v1/build_target",
+                    ErrorKind::Validation,
                 )));
                 return;
             }
@@ -384,10 +427,12 @@ impl Server {
         let request = match decode_params::<OpenRequest>(params) {
             Ok(r) => r,
             Err(message) => {
-                sink.send(frame_bytes(&Response::error(
+                sink.send(frame_bytes(&direct_error(
                     Some(id),
                     ERR_INVALID_PARAMS,
                     message,
+                    "perk/v1/open",
+                    ErrorKind::Validation,
                 )));
                 return;
             }
@@ -395,7 +440,11 @@ impl Server {
         let (info, service) = match self.factory.open(&request.target).await {
             Ok(v) => v,
             Err(e) => {
-                sink.send(frame_bytes(&error_response(Some(id), &e)));
+                sink.send(frame_bytes(&service_error_response(
+                    Some(id),
+                    "perk/v1/open",
+                    &e,
+                )));
                 return;
             }
         };
@@ -414,10 +463,12 @@ impl Server {
         let request = match decode_params::<CloseRequest>(params) {
             Ok(r) => r,
             Err(message) => {
-                sink.send(frame_bytes(&Response::error(
+                sink.send(frame_bytes(&direct_error(
                     Some(id),
                     ERR_INVALID_PARAMS,
                     message,
+                    "perk/v1/close",
+                    ErrorKind::Validation,
                 )));
                 return;
             }
@@ -431,10 +482,12 @@ impl Server {
                 sink.send(frame_bytes(&Response::result(Some(id), Value::Null)));
             }
             None => {
-                sink.send(frame_bytes(&Response::error(
+                sink.send(frame_bytes(&direct_error(
                     Some(id),
                     ERR_INVALID_PARAMS,
                     "invalid params: unknown session_id",
+                    "perk/v1/close",
+                    ErrorKind::Validation,
                 )));
             }
         }
@@ -452,26 +505,32 @@ impl Server {
         sink: &Sink,
     ) {
         let Some(obj) = params.as_ref().and_then(Value::as_object) else {
-            sink.send(frame_bytes(&Response::error(
+            sink.send(frame_bytes(&direct_error(
                 Some(id),
                 ERR_INVALID_PARAMS,
                 "invalid params: expected an object",
+                method,
+                ErrorKind::Validation,
             )));
             return;
         };
         let Some(session_id) = obj.get("session_id").and_then(Value::as_u64) else {
-            sink.send(frame_bytes(&Response::error(
+            sink.send(frame_bytes(&direct_error(
                 Some(id),
                 ERR_INVALID_PARAMS,
                 "invalid params: missing or non-integer session_id",
+                method,
+                ErrorKind::Validation,
             )));
             return;
         };
         let Some(session) = self.sessions.read().await.get(&session_id).cloned() else {
-            sink.send(frame_bytes(&Response::error(
+            sink.send(frame_bytes(&direct_error(
                 Some(id),
                 ERR_INVALID_PARAMS,
                 "invalid params: unknown session_id",
+                method,
+                ErrorKind::Validation,
             )));
             return;
         };
@@ -505,7 +564,7 @@ impl Server {
             };
             let response = match outcome {
                 Ok(value) => Response::result(Some(id.clone()), value),
-                Err(e) => error_response(Some(id), &e),
+                Err(e) => service_error_response(Some(id), &method, &e),
             };
             sink.send(frame_bytes(&response));
             registry.remove(key);
@@ -521,8 +580,39 @@ fn decode_params<T: serde::de::DeserializeOwned>(params: Option<Value>) -> Resul
     }
 }
 
-fn error_response(id: Option<Number>, error: &ServiceError) -> Response {
-    Response::error(id, error.jsonrpc_code(), error.message.clone())
+/// Builds one direct server error response with full structured
+/// provenance: the stable kind, the plugin identity, and the actual wire
+/// method, exactly once. `method` is the method the request named (empty
+/// when the frame carried none), so the method can never be duplicated
+/// or mismatched at a callsite.
+fn direct_error(
+    id: Option<Number>,
+    code: i32,
+    message: impl Into<String>,
+    method: &str,
+    kind: ErrorKind,
+) -> Response {
+    Response::error(
+        id,
+        ErrorObject::with_provenance(code, message, kind, PLUGIN, method),
+    )
+}
+
+/// Builds one service error response: the handler's normalized kind
+/// rides in `data` next to the plugin identity and the actual wire
+/// method. The method comes from the dispatch site, so it can never
+/// mismatch the handled RPC.
+fn service_error_response(id: Option<Number>, method: &str, error: &ServiceError) -> Response {
+    Response::error(
+        id,
+        ErrorObject::with_provenance(
+            error.jsonrpc_code(),
+            error.message.clone(),
+            error.kind,
+            PLUGIN,
+            method,
+        ),
+    )
 }
 
 /// Decodes the handler request, runs the trait method, and races it
@@ -535,9 +625,8 @@ async fn run_session_method(
 ) -> Result<Value, ServiceError> {
     macro_rules! call {
         ($req:ty, $trait_method:ident) => {{
-            let request: $req = serde_json::from_value(rest.clone()).map_err(|e| {
-                ServiceError::with_code(ERR_INVALID_PARAMS, format!("invalid params: {e}"))
-            })?;
+            let request: $req = serde_json::from_value(rest.clone())
+                .map_err(|e| ServiceError::invalid_params(format!("invalid params: {e}")))?;
             let mut fut = session.$trait_method(request, token.clone());
             tokio::select! {
                 r = &mut fut => r,
@@ -562,9 +651,7 @@ async fn run_session_method(
         "perk/v1/row_write" => {
             let request: RowWriteRequest =
                 serde_json::from_value(rest.get("request").cloned().unwrap_or(Value::Null))
-                    .map_err(|e| {
-                        ServiceError::with_code(ERR_INVALID_PARAMS, format!("invalid params: {e}"))
-                    })?;
+                    .map_err(|e| ServiceError::invalid_params(format!("invalid params: {e}")))?;
             let mut fut = session.row_write(request, token.clone());
             tokio::select! {
                 r = &mut fut => r,
@@ -593,10 +680,9 @@ async fn run_session_method(
         "perk/v1/drop_column" => call!(DropRequest, drop_column),
         "perk/v1/add_column" => call!(AddColumnRequest, add_column),
         "perk/v1/browse_table" => call!(BrowseTableRequest, browse_table),
-        _ => Err(ServiceError::with_code(
-            ERR_METHOD_NOT_FOUND,
-            format!("method not found: {method}"),
-        )),
+        _ => Err(ServiceError::method_not_found(format!(
+            "method not found: {method}"
+        ))),
     }
 }
 
@@ -833,6 +919,24 @@ mod tests {
         );
     }
 
+    /// Asserts the structured provenance of one error response: the
+    /// stable kind, the plugin identity, and the actual wire method,
+    /// rendered exactly once with a single `perk/v1/` prefix (an empty
+    /// advisory method is the frame-without-method case).
+    fn assert_provenance(response: &Value, kind: &str, method: &str) {
+        let data = &response["error"]["data"];
+        assert_eq!(data["kind"], json!(kind), "error kind: {response}");
+        assert_eq!(data["plugin"], json!("redis"), "plugin: {response}");
+        assert_eq!(data["method"], json!(method), "method: {response}");
+        if !method.is_empty() {
+            assert_eq!(
+                data["method"].as_str().unwrap().matches("perk/v1/").count(),
+                1,
+                "the method renders exactly once: {response}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn initialize_reports_exact_capabilities() {
         let mut h = Harness::start().await;
@@ -864,7 +968,18 @@ mod tests {
                             {"key": "database", "title": "Database", "kind": 0, "default": "0", "validate": 0}
                         ]
                     },
-                    "write_capabilities": {"row_writer": true}
+                    "write_capabilities": {"row_writer": true},
+                    "query_language": {
+                        "name": "Redis",
+                        "editor_label": "Command",
+                        "placeholder": "Enter a Redis command, e.g. GET user:1",
+                        "examples": [
+                            "PING",
+                            "GET user:1",
+                            "SET user:1 v1 NX",
+                            "SELECT * FROM \"keys\" LIMIT 25"
+                        ]
+                    }
                 }
             }),
             "initialize result must match the contract exactly"
@@ -882,6 +997,7 @@ mod tests {
         let response = h.response().await;
         assert_eq!(response["id"], json!(7), "id must be echoed: {response}");
         assert_error(&response, ERR_INVALID_REQUEST);
+        assert_provenance(&response, "validation", "perk/v1/list_schema");
         h.finish().await.expect("clean EOF exit");
     }
 
@@ -896,6 +1012,7 @@ mod tests {
         let response = h.response().await;
         assert_eq!(response["id"], json!(2));
         assert_error(&response, ERR_INVALID_REQUEST);
+        assert_provenance(&response, "validation", "perk/v1/initialize");
         h.finish().await.expect("clean EOF exit");
     }
 
@@ -906,6 +1023,7 @@ mod tests {
             .await;
         let response = h.response().await;
         assert_error(&response, ERR_INVALID_REQUEST);
+        assert_provenance(&response, "validation", "perk/v1/initialize");
         h.finish().await.expect("clean EOF exit");
     }
 
@@ -920,6 +1038,7 @@ mod tests {
         let response = h.response().await;
         assert_eq!(response["id"], json!(2));
         assert_error(&response, ERR_METHOD_NOT_FOUND);
+        assert_provenance(&response, "unsupported", "perk/v1/frobnicate");
         h.finish().await.expect("clean EOF exit");
     }
 
@@ -934,11 +1053,13 @@ mod tests {
             .await;
         let response = h.response().await;
         assert_error(&response, ERR_INVALID_PARAMS);
+        assert_provenance(&response, "validation", "perk/v1/execute");
         // Wrong-typed statement field.
         h.send(r#"{"jsonrpc":"2.0","id":3,"method":"perk/v1/execute","params":{"session_id":1,"statement":123}}"#)
             .await;
         let response = h.response().await;
         assert_error(&response, ERR_INVALID_PARAMS);
+        assert_provenance(&response, "validation", "perk/v1/execute");
         h.finish().await.expect("clean EOF exit");
     }
 
@@ -961,6 +1082,7 @@ mod tests {
             .await;
         let response = h.response().await;
         assert_error(&response, ERR_INVALID_PARAMS);
+        assert_provenance(&response, "validation", "perk/v1/execute");
         // Missing session_id.
         h.send(
             r#"{"jsonrpc":"2.0","id":4,"method":"perk/v1/execute","params":{"statement":"GET x"}}"#,
@@ -968,11 +1090,13 @@ mod tests {
         .await;
         let response = h.response().await;
         assert_error(&response, ERR_INVALID_PARAMS);
+        assert_provenance(&response, "validation", "perk/v1/execute");
         // Closing an unknown session is also -32602.
         h.send(r#"{"jsonrpc":"2.0","id":5,"method":"perk/v1/close","params":{"session_id":999}}"#)
             .await;
         let response = h.response().await;
         assert_error(&response, ERR_INVALID_PARAMS);
+        assert_provenance(&response, "validation", "perk/v1/close");
         h.finish().await.expect("clean EOF exit");
     }
 
@@ -998,11 +1122,13 @@ mod tests {
             .await;
         let response = h.response().await;
         assert_error(&response, ERR_INVALID_PARAMS);
+        assert_provenance(&response, "validation", "perk/v1/close");
         // A closed session no longer serves methods.
         h.send(r#"{"jsonrpc":"2.0","id":5,"method":"perk/v1/execute","params":{"session_id":1,"statement":"GET x"}}"#)
             .await;
         let response = h.response().await;
         assert_error(&response, ERR_INVALID_PARAMS);
+        assert_provenance(&response, "validation", "perk/v1/execute");
         h.finish().await.expect("clean EOF exit");
     }
 
@@ -1024,6 +1150,7 @@ mod tests {
         let response = h.response().await;
         assert_eq!(response["id"], json!(3), "canceled request id: {response}");
         assert_error(&response, ERR_CANCELED);
+        assert_provenance(&response, "cancelled", "perk/v1/execute");
         // The transport stays live after cancellation: close the session.
         h.send(r#"{"jsonrpc":"2.0","id":4,"method":"perk/v1/close","params":{"session_id":1}}"#)
             .await;
@@ -1232,7 +1359,7 @@ mod tests {
         let response = h.response().await;
         assert_eq!(response["result"], json!({"result": {"rows_affected": 0}}));
 
-        // A semantically malformed payload is an operation error (not a
+        // A semantically malformed payload is a validation error (not a
         // -32602: the params decode fine), keeping the transport alive.
         h.send(r#"{"jsonrpc":"2.0","id":11,"method":"perk/v1/row_write","params":{"session_id":1,"request":{"operation":"upsert","table":"kv"}}}"#)
             .await;
@@ -1244,6 +1371,7 @@ mod tests {
                 .is_some_and(|m| m.contains("row_write") || m.contains("operation")),
             "operation error message: {response}"
         );
+        assert_provenance(&response, "validation", "perk/v1/row_write");
 
         // Params that do not decode are -32602 like every other RPC.
         h.send(r#"{"jsonrpc":"2.0","id":12,"method":"perk/v1/row_write","params":{"session_id":1,"request":42}}"#)
@@ -1256,7 +1384,97 @@ mod tests {
             .await;
         let response = h.response().await;
         assert_error(&response, ERR_METHOD_NOT_FOUND);
+        assert_provenance(&response, "unsupported", "perk/v1/document_write");
 
+        h.finish().await.expect("clean EOF exit");
+    }
+
+    // --- structured error provenance --------------------------------------
+
+    #[test]
+    fn service_error_response_renders_every_kind_exactly() {
+        for (kind, wire) in [
+            (ErrorKind::Validation, "validation"),
+            (ErrorKind::Authentication, "authentication"),
+            (ErrorKind::Connection, "connection"),
+            (ErrorKind::Operation, "operation"),
+            (ErrorKind::Unsupported, "unsupported"),
+            (ErrorKind::Cancelled, "cancelled"),
+            (ErrorKind::Protocol, "protocol"),
+            (ErrorKind::PluginCrash, "plugin_crash"),
+        ] {
+            let error = ServiceError {
+                code: None,
+                message: "boom".to_string(),
+                kind,
+            };
+            let response = service_error_response(
+                Some(serde_json::Number::from(1)),
+                "perk/v1/execute",
+                &error,
+            );
+            let value: Value = serde_json::from_str(
+                &String::from_utf8(frame_bytes(&response)).expect("frame is UTF-8"),
+            )
+            .expect("frame is JSON");
+            assert_eq!(value["error"]["data"]["kind"], json!(wire), "kind {wire}");
+            assert_eq!(value["error"]["data"]["plugin"], json!("redis"));
+            assert_eq!(value["error"]["data"]["method"], json!("perk/v1/execute"));
+            assert_eq!(value["error"]["code"], json!(ERR_INTERNAL));
+        }
+    }
+
+    #[test]
+    fn service_error_response_serializes_the_exact_envelope() {
+        let error = ServiceError::validation("empty statement");
+        let response =
+            service_error_response(Some(serde_json::Number::from(9)), "perk/v1/execute", &error);
+        assert_eq!(
+            String::from_utf8(frame_bytes(&response)).expect("frame is UTF-8"),
+            r#"{"jsonrpc":"2.0","id":9,"error":{"code":-32603,"message":"empty statement","data":{"kind":"validation","plugin":"redis","method":"perk/v1/execute"}}}"#.to_string()
+                + "\n"
+        );
+    }
+
+    #[test]
+    fn canceled_error_uses_32800_with_cancelled_kind() {
+        let error = ServiceError::canceled("request canceled");
+        assert_eq!(error.jsonrpc_code(), ERR_CANCELED);
+        let response =
+            service_error_response(Some(serde_json::Number::from(3)), "perk/v1/execute", &error);
+        assert_eq!(
+            String::from_utf8(frame_bytes(&response)).expect("frame is UTF-8"),
+            r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32800,"message":"request canceled","data":{"kind":"cancelled","plugin":"redis","method":"perk/v1/execute"}}}"#.to_string()
+                + "\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn envelope_errors_carry_the_frame_method_in_provenance() {
+        let mut h = Harness::start().await;
+        // Wrong jsonrpc: answered -32600 with validation provenance and
+        // the method the frame named.
+        h.send(r#"{"jsonrpc":"1.0","id":1,"method":"perk/v1/initialize","params":{"protocol_version":1,"workbench_version":"x"}}"#)
+            .await;
+        let response = h.response().await;
+        assert_error(&response, ERR_INVALID_REQUEST);
+        assert_provenance(&response, "validation", "perk/v1/initialize");
+
+        // Non-integer id: id null on the envelope, provenance carries
+        // the frame's method.
+        h.send(r#"{"jsonrpc":"2.0","id":"1","method":"perk/v1/execute","params":{"session_id":7,"statement":"SELECT 1"}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["id"], Value::Null, "id must be null: {response}");
+        assert_error(&response, ERR_INVALID_REQUEST);
+        assert_provenance(&response, "validation", "perk/v1/execute");
+
+        // A request without a method is answered with validation
+        // provenance and an empty advisory method.
+        h.send(r#"{"jsonrpc":"2.0","id":2,"params":{}}"#).await;
+        let response = h.response().await;
+        assert_error(&response, ERR_INVALID_REQUEST);
+        assert_provenance(&response, "validation", "");
         h.finish().await.expect("clean EOF exit");
     }
 }

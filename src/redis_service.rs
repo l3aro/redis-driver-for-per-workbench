@@ -29,7 +29,7 @@ use crate::dto::request::{
 };
 use crate::dto::service::{
     ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, QueryResult, ReferencingForeignKeyInfo,
-    SchemaObject,
+    SchemaObject, StatementMetadata,
 };
 use crate::dto::write::{RowValue, RowWriteRequest, RowWriteResponse, RowsAffected};
 use crate::service::{OpenFuture, ServiceError, ServiceFuture, SessionFactory, SessionService};
@@ -115,10 +115,10 @@ enum Statement {
 /// table grammar; everything else stays a native Redis command line.
 fn parse_statement(statement: &str) -> Result<Statement, ServiceError> {
     if statement.trim().is_empty() {
-        return Err(ServiceError::new("empty statement"));
+        return Err(ServiceError::validation("empty statement"));
     }
     let tokens = shell_words::split(statement)
-        .map_err(|e| ServiceError::new(format!("invalid statement: {e}")))?;
+        .map_err(|e| ServiceError::validation(format!("invalid statement: {e}")))?;
     // `SELECT *` is unambiguous: Redis's SELECT takes a database index,
     // never `*`, so only a virtual-table query can start this way. Any
     // other SELECT (e.g. the native `SELECT 2`) stays a Redis command.
@@ -139,7 +139,7 @@ fn parse_statement(statement: &str) -> Result<Statement, ServiceError> {
 /// `keys` table whether double-quoted or bare; LIMIT and OFFSET are
 /// non-negative integers in either order.
 fn parse_select(tokens: &[String]) -> Result<Statement, ServiceError> {
-    let bad = |message: String| ServiceError::new(format!("invalid statement: {message}"));
+    let bad = |message: String| ServiceError::validation(format!("invalid statement: {message}"));
     // A `;` glued to the final token is the statement terminator
     // (`LIMIT 25;`); anywhere else it stays part of the token so a
     // terminator can never hide trailing clauses. A standalone final
@@ -219,6 +219,178 @@ fn is_read_only(verb: &str) -> bool {
         .any(|command| command.eq_ignore_ascii_case(verb))
 }
 
+// --- statement metadata -------------------------------------------------
+
+/// Commands whose statement embeds a value, payload, credential, or
+/// script, so the text must never be stored verbatim: the host redacts
+/// it and forces the entry non-replayable. Covers credential
+/// configuration (AUTH, HELLO AUTH, ACL SETUSER, CONFIG, MIGRATE AUTH)
+/// and every value-bearing write; anything else unknown or module-level
+/// defaults to sensitive as well (see [`command_metadata`]).
+const SENSITIVE_COMMANDS: &[&str] = &[
+    "ACL",
+    "APPEND",
+    "AUTH",
+    "BITFIELD",
+    "BLMOVE",
+    "CONFIG",
+    "DEBUG",
+    "DECRBY",
+    "ECHO",
+    "EVAL",
+    "EVALSHA",
+    "FCALL",
+    "FCALL_RO",
+    "FUNCTION",
+    "GEOADD",
+    "GETSET",
+    "HELLO",
+    "HINCRBY",
+    "HINCRBYFLOAT",
+    "HMSET",
+    "HSET",
+    "HSETNX",
+    "INCRBY",
+    "INCRBYFLOAT",
+    "LINSERT",
+    "LMOVE",
+    "LPUSH",
+    "LPUSHX",
+    "LSET",
+    "MIGRATE",
+    "MSET",
+    "MSETNX",
+    "PFADD",
+    "PSETEX",
+    "PUBLISH",
+    "RESTORE",
+    "RPUSH",
+    "RPUSHX",
+    "SADD",
+    "SCRIPT",
+    "SET",
+    "SETBIT",
+    "SETEX",
+    "SETNX",
+    "SETRANGE",
+    "SMOVE",
+    "SREM",
+    "SPUBLISH",
+    "XADD",
+    "XCLAIM",
+    "XAUTOCLAIM",
+    "XSETID",
+    "ZADD",
+    "ZINCRBY",
+];
+
+/// Key-only writes with no payload: pasting the statement into the
+/// plugin's editor reproduces the operation, and no value ever appears
+/// in the text, so they stay non-sensitive and replayable.
+const SAFE_WRITE_COMMANDS: &[&str] = &[
+    "COPY",
+    "DEL",
+    "DISCARD",
+    "EXEC",
+    "EXPIRE",
+    "EXPIREAT",
+    "FLUSHALL",
+    "FLUSHDB",
+    "MOVE",
+    "MULTI",
+    "PERSIST",
+    "PEXPIRE",
+    "PEXPIREAT",
+    "QUIT",
+    "RENAME",
+    "RENAMENX",
+    "RESET",
+    "SELECT",
+    "SWAPDB",
+    "TOUCH",
+    "UNLINK",
+    "UNWATCH",
+    "WATCH",
+];
+
+/// Classifies one native Redis command for statement metadata.
+/// `replayable` is true only when pasting the statement into this
+/// plugin's editor reproduces the operation; `sensitive` marks
+/// statements that embed a value/payload and must never be stored
+/// verbatim. Read commands and key-only writes are benign; value-bearing
+/// writes, credential configuration, and unknown/module commands
+/// (which may embed payloads) default to sensitive.
+///
+/// The read-only allowlist was audited argument by argument: every entry
+/// takes only keys, patterns, numeric ranges/limits, or an INFO section
+/// name — locators and query parameters, never stored values. The one
+/// exception is PING's optional message argument, an arbitrary payload
+/// the server echoes back, so it is special-cased below.
+fn command_metadata(tokens: &[String]) -> StatementMetadata {
+    let Some(verb) = tokens.first().map(String::as_str) else {
+        // Unreachable: empty token lists are rejected before execution.
+        return StatementMetadata::redis(false, true);
+    };
+    let verb = verb.to_ascii_uppercase();
+    // PING carries an optional arbitrary message: `PING <payload>`
+    // embeds that payload in the statement, so any argument makes it
+    // sensitive and non-replayable; a bare PING is a health check and
+    // stays benign.
+    if verb == "PING" {
+        return StatementMetadata::redis(tokens.len() == 1, tokens.len() > 1);
+    }
+    if is_read_only(&verb) {
+        StatementMetadata::redis(true, false)
+    } else if SENSITIVE_COMMANDS.contains(&verb.as_str()) {
+        StatementMetadata::redis(false, true)
+    } else if SAFE_WRITE_COMMANDS.contains(&verb.as_str()) {
+        StatementMetadata::redis(true, false)
+    } else {
+        // Unknown or module commands may embed payloads: conservative.
+        StatementMetadata::redis(false, true)
+    }
+}
+
+/// The exact pseudo-command `execute` replays for one virtual keys
+/// browse: the host-generated `SELECT * FROM "keys"` grammar with the
+/// effective paging clauses (the host always sends `LIMIT n OFFSET m`,
+/// so an explicit zero offset with a limit keeps its clause), replayable
+/// and non-sensitive.
+fn select_statement(offset: usize, limit: Option<usize>) -> String {
+    let mut statement = format!("SELECT * FROM \"{KEYS_TABLE}\"");
+    if let Some(limit) = limit {
+        statement.push_str(&format!(" LIMIT {limit}"));
+    }
+    if offset > 0 || limit.is_some() {
+        statement.push_str(&format!(" OFFSET {offset}"));
+    }
+    statement
+}
+
+// --- error classification -----------------------------------------------
+
+/// Maps one redis crate error onto the stable error kinds: credential
+/// failures (AUTH handshake, `NOAUTH`/`WRONGPASS`/`NOPERM` replies) ->
+/// `authentication`; I/O and dropped connections -> `connection`;
+/// client-side configuration (unparseable URL) -> `validation`; every
+/// other server or unexpected error -> `operation`. The message keeps
+/// the caller's safe prefix; nothing beyond it enters the error text.
+fn map_redis_error(e: &redis::RedisError, prefix: &str) -> ServiceError {
+    let message = format!("{prefix}{e}");
+    let auth_code = matches!(e.code(), Some("NOAUTH" | "WRONGPASS" | "NOPERM"));
+    // Real server replies carry the code; synthetic and extended errors
+    // surface it in the text instead. Either way the classification is
+    // deterministic and testable.
+    let auth_text = e.to_string().contains("NOAUTH") || e.to_string().contains("WRONGPASS");
+    match e.kind() {
+        redis::ErrorKind::AuthenticationFailed => ServiceError::authentication(message),
+        redis::ErrorKind::Io => ServiceError::connection(message),
+        redis::ErrorKind::InvalidClientConfig => ServiceError::validation(message),
+        _ if auth_code || auth_text => ServiceError::authentication(message),
+        _ => ServiceError::new(message),
+    }
+}
+
 // --- row writes ---------------------------------------------------------
 
 /// The atomic update script, shared verbatim by execution and the
@@ -262,10 +434,11 @@ return 1
 /// leaves them bare, which would collapse an empty key/argument into the
 /// neighbouring token when split back. Row writes return this as the
 /// wire `statement` for the host's query log.
-fn render_command(tokens: &[&str]) -> String {
+fn render_command<S: AsRef<str>>(tokens: &[S]) -> String {
     tokens
         .iter()
         .map(|token| {
+            let token = token.as_ref();
             if token.is_empty() {
                 "''".to_string()
             } else {
@@ -299,7 +472,7 @@ enum RowWrite {
 /// Redis I/O happens.
 fn parse_row_write(request: &RowWriteRequest) -> Result<RowWrite, ServiceError> {
     if request.table != KEYS_TABLE {
-        return Err(ServiceError::new(format!(
+        return Err(ServiceError::unsupported(format!(
             "unknown table: {}",
             request.table
         )));
@@ -309,7 +482,9 @@ fn parse_row_write(request: &RowWriteRequest) -> Result<RowWrite, ServiceError> 
             if let Some(values) = &request.values
                 && !values.is_empty()
             {
-                return Err(ServiceError::new("delete does not accept a values payload"));
+                return Err(ServiceError::validation(
+                    "delete does not accept a values payload",
+                ));
             }
             Ok(RowWrite::Delete {
                 key: parse_identity(request.key.as_deref())?,
@@ -320,7 +495,7 @@ fn parse_row_write(request: &RowWriteRequest) -> Result<RowWrite, ServiceError> 
             let values = request
                 .values
                 .as_deref()
-                .ok_or_else(|| ServiceError::new("update requires a values payload"))?;
+                .ok_or_else(|| ServiceError::validation("update requires a values payload"))?;
             let (rename_to, value) = parse_update_values(values)?;
             Ok(RowWrite::Update {
                 key,
@@ -330,16 +505,18 @@ fn parse_row_write(request: &RowWriteRequest) -> Result<RowWrite, ServiceError> 
         }
         "insert" => {
             if request.key.is_some() {
-                return Err(ServiceError::new("insert does not accept a key identity"));
+                return Err(ServiceError::validation(
+                    "insert does not accept a key identity",
+                ));
             }
             let values = request
                 .values
                 .as_deref()
-                .ok_or_else(|| ServiceError::new("insert requires a values payload"))?;
+                .ok_or_else(|| ServiceError::validation("insert requires a values payload"))?;
             let (key, value) = parse_insert_values(values)?;
             Ok(RowWrite::Insert { key, value })
         }
-        other => Err(ServiceError::new(format!(
+        other => Err(ServiceError::validation(format!(
             "unsupported row_write operation: {other}"
         ))),
     }
@@ -350,36 +527,36 @@ fn parse_row_write(request: &RowWriteRequest) -> Result<RowWrite, ServiceError> 
 /// rejected as empty.
 fn parse_identity(cells: Option<&[RowValue]>) -> Result<String, ServiceError> {
     let Some(cells) = cells else {
-        return Err(ServiceError::new("missing key fields"));
+        return Err(ServiceError::validation("missing key fields"));
     };
     let mut found: Option<String> = None;
     for cell in cells {
         if cell.name != "key" {
-            return Err(ServiceError::new(format!(
+            return Err(ServiceError::validation(format!(
                 "unknown key column: {}",
                 cell.name
             )));
         }
         if found.is_some() {
-            return Err(ServiceError::new("duplicate key fields"));
+            return Err(ServiceError::validation("duplicate key fields"));
         }
         found = Some(require_string(cell)?);
     }
-    found.ok_or_else(|| ServiceError::new("missing key fields"))
+    found.ok_or_else(|| ServiceError::validation("missing key fields"))
 }
 
 /// One cell payload must be a plain string; every other Value kind is
 /// rejected (typed, default, null, collections).
 fn require_string(cell: &RowValue) -> Result<String, ServiceError> {
     if cell.value.kind != "string" {
-        return Err(ServiceError::new(format!(
+        return Err(ServiceError::validation(format!(
             "column {} must be a string value (got {} kind)",
             cell.name, cell.value.kind
         )));
     }
     match &cell.value.string {
         Some(s) => Ok(s.clone()),
-        None => Err(ServiceError::new(format!(
+        None => Err(ServiceError::validation(format!(
             "column {}: string kind without a payload",
             cell.name
         ))),
@@ -398,30 +575,32 @@ fn parse_update_values(
         match cell.name.as_str() {
             "key" => {
                 if rename_to.is_some() {
-                    return Err(ServiceError::new("duplicate column: key"));
+                    return Err(ServiceError::validation("duplicate column: key"));
                 }
                 let destination = require_string(cell)?;
                 if destination.is_empty() {
-                    return Err(ServiceError::new("rename destination must not be empty"));
+                    return Err(ServiceError::validation(
+                        "rename destination must not be empty",
+                    ));
                 }
                 rename_to = Some(destination);
             }
             "value" => {
                 if value.is_some() {
-                    return Err(ServiceError::new("duplicate column: value"));
+                    return Err(ServiceError::validation("duplicate column: value"));
                 }
                 value = Some(require_string(cell)?);
             }
             "type" => {
-                return Err(ServiceError::new("column type is immutable"));
+                return Err(ServiceError::validation("column type is immutable"));
             }
             other => {
-                return Err(ServiceError::new(format!("unknown column: {other}")));
+                return Err(ServiceError::validation(format!("unknown column: {other}")));
             }
         }
     }
     if rename_to.is_none() && value.is_none() {
-        return Err(ServiceError::new(
+        return Err(ServiceError::validation(
             "update requires at least one column change",
         ));
     }
@@ -438,19 +617,19 @@ fn parse_insert_values(cells: &[RowValue]) -> Result<(String, String), ServiceEr
         match cell.name.as_str() {
             "key" => {
                 if key.is_some() {
-                    return Err(ServiceError::new("duplicate column: key"));
+                    return Err(ServiceError::validation("duplicate column: key"));
                 }
                 key = Some(require_string(cell)?);
             }
             "value" => {
                 if value.is_some() {
-                    return Err(ServiceError::new("duplicate column: value"));
+                    return Err(ServiceError::validation("duplicate column: value"));
                 }
                 value = Some(require_string(cell)?);
             }
             "type" => {
                 if type_seen {
-                    return Err(ServiceError::new("duplicate column: type"));
+                    return Err(ServiceError::validation("duplicate column: type"));
                 }
                 type_seen = true;
                 // Only an explicit string type is accepted: "string" or a
@@ -460,26 +639,26 @@ fn parse_insert_values(cells: &[RowValue]) -> Result<(String, String), ServiceEr
                 // kind.
                 let type_ = match cell.value.kind.as_str() {
                     "string" => cell.value.string.clone().ok_or_else(|| {
-                        ServiceError::new("column type: string kind without a payload")
+                        ServiceError::validation("column type: string kind without a payload")
                     })?,
                     other => {
-                        return Err(ServiceError::new(format!(
+                        return Err(ServiceError::validation(format!(
                             "column type must be a string value (got {other} kind)"
                         )));
                     }
                 };
                 if !type_.is_empty() && type_ != "string" {
-                    return Err(ServiceError::new(format!(
+                    return Err(ServiceError::validation(format!(
                         "cannot insert: type {type_} is not supported (only string)"
                     )));
                 }
             }
             other => {
-                return Err(ServiceError::new(format!("unknown column: {other}")));
+                return Err(ServiceError::validation(format!("unknown column: {other}")));
             }
         }
     }
-    let key = key.ok_or_else(|| ServiceError::new("insert requires a key column"))?;
+    let key = key.ok_or_else(|| ServiceError::validation("insert requires a key column"))?;
     Ok((key, value.unwrap_or_default()))
 }
 
@@ -587,12 +766,15 @@ fn cap_cell(s: &str) -> String {
 }
 
 /// Builds the wire Result: display rows capped at [`MAX_ROWS`] with cells
-/// capped at [`MAX_CELL`], full values preserved in `untruncated_rows`.
+/// capped at [`MAX_CELL`], full values preserved in `untruncated_rows`,
+/// plus the exact accepted statement and its metadata.
 fn finalize(
     columns: Vec<String>,
     full_rows: Vec<Vec<Option<String>>>,
     duration: Duration,
     has_more: bool,
+    statement: Option<String>,
+    statement_metadata: Option<StatementMetadata>,
 ) -> QueryResult {
     let truncated = full_rows.len() > MAX_ROWS;
     let shown: &[Vec<Option<String>>] = if truncated {
@@ -619,6 +801,8 @@ fn finalize(
         duration_ns: duration.as_nanos() as u64,
         truncated,
         document_ids: None,
+        statement,
+        statement_metadata,
     }
 }
 
@@ -696,12 +880,16 @@ fn normalize_target(target: &str) -> Result<String, ServiceError> {
     } else if let Some(rest) = trimmed.strip_prefix("redis:") {
         let rest = rest.trim();
         if rest.is_empty() {
-            Err(ServiceError::new("invalid target: missing redis:// URI"))
+            Err(ServiceError::validation(
+                "invalid target: missing redis:// URI",
+            ))
         } else {
             Ok(rest.to_string())
         }
     } else {
-        Err(ServiceError::new("invalid target: expected a redis:// URI"))
+        Err(ServiceError::validation(
+            "invalid target: expected a redis:// URI",
+        ))
     }
 }
 
@@ -714,7 +902,7 @@ fn parse_database(url: &Url) -> Result<i64, ServiceError> {
     }
     match path.parse::<i64>() {
         Ok(db) if db >= 0 => Ok(db),
-        _ => Err(ServiceError::new(format!(
+        _ => Err(ServiceError::validation(format!(
             "invalid target: invalid database number: {path}"
         ))),
     }
@@ -741,19 +929,21 @@ impl RedisService {
         }
     }
 
-    /// Runs one command and maps Redis errors to operation errors. A
+    /// Runs one command and maps Redis errors onto the stable kinds:
+    /// credential failures become authentication, dropped connections
+    /// become connection, and server command errors stay operation. A
     /// closed session rejects commands without touching the network.
     async fn query<T: redis::FromRedisValue>(&self, cmd: &redis::Cmd) -> Result<T, ServiceError> {
         if self.closed.load(Ordering::Relaxed) {
-            return Err(ServiceError::new("session closed"));
+            return Err(ServiceError::connection("session closed"));
         }
         let mut guard = self.conn.lock().await;
         let conn = guard
             .as_mut()
-            .ok_or_else(|| ServiceError::new("session closed"))?;
+            .ok_or_else(|| ServiceError::connection("session closed"))?;
         cmd.query_async::<T>(conn)
             .await
-            .map_err(|e| ServiceError::new(format!("redis: {e}")))
+            .map_err(|e| map_redis_error(&e, "redis: "))
     }
 
     /// Forwards one parsed statement as a raw `redis::Cmd` and returns
@@ -775,7 +965,9 @@ impl RedisService {
     /// Executes a virtual-table SELECT over the fixed `keys` table,
     /// paged exactly like `browse_table`: sorted keys with type and
     /// bounded value previews, `has_more` when the page is not the
-    /// last, display rows capped at [`MAX_ROWS`].
+    /// last, display rows capped at [`MAX_ROWS`]. The result reports the
+    /// exact pseudo-command `execute` replays, non-sensitive and
+    /// replayable.
     async fn run_select(
         &self,
         offset: usize,
@@ -793,6 +985,8 @@ impl RedisService {
             full_rows,
             elapsed,
             has_more,
+            Some(select_statement(offset, limit)),
+            Some(StatementMetadata::redis(true, false)),
         ))
     }
 
@@ -1087,12 +1281,12 @@ impl RedisService {
             args[3],
         ]);
         if self.closed.load(Ordering::Relaxed) {
-            return Err(ServiceError::new("session closed"));
+            return Err(ServiceError::connection("session closed"));
         }
         let mut guard = self.conn.lock().await;
         let conn = guard
             .as_mut()
-            .ok_or_else(|| ServiceError::new("session closed"))?;
+            .ok_or_else(|| ServiceError::connection("session closed"))?;
         let affected: i64 = redis::Script::new(UPDATE_SCRIPT)
             .key(key)
             .arg(args[0])
@@ -1101,7 +1295,7 @@ impl RedisService {
             .arg(args[3])
             .invoke_async(conn)
             .await
-            .map_err(|e| ServiceError::new(format!("redis: {e}")))?;
+            .map_err(|e| map_redis_error(&e, "redis: "))?;
         Ok((affected.max(0) as u64, statement))
     }
 }
@@ -1149,12 +1343,24 @@ impl SessionService for RedisService {
                 Statement::Redis(tokens) => {
                     if tokens.is_empty() {
                         // e.g. a comment-only statement parses to zero tokens.
-                        return Err(ServiceError::new("empty statement"));
+                        return Err(ServiceError::validation("empty statement"));
                     }
+                    // The exact command accepted by the plugin, rendered
+                    // from the parsed tokens so it round-trips through
+                    // the plugin's own parser.
+                    let statement = render_command(&tokens);
+                    let metadata = command_metadata(&tokens);
                     let (duration, reply) = this.run_command(&tokens).await?;
                     let (columns, full_rows) = reply_rows(&reply);
                     let truncated = full_rows.len() > MAX_ROWS;
-                    Ok(finalize(columns, full_rows, duration, truncated))
+                    Ok(finalize(
+                        columns,
+                        full_rows,
+                        duration,
+                        truncated,
+                        Some(statement),
+                        Some(metadata),
+                    ))
                 }
                 Statement::SelectKeys { offset, limit } => this.run_select(offset, limit).await,
             }
@@ -1176,18 +1382,27 @@ impl SessionService for RedisService {
                 Statement::Redis(tokens) => {
                     if tokens.is_empty() {
                         // e.g. a comment-only statement parses to zero tokens.
-                        return Err(ServiceError::new("empty statement"));
+                        return Err(ServiceError::validation("empty statement"));
                     }
                     let verb = tokens[0].to_ascii_uppercase();
                     if !is_read_only(&verb) {
-                        return Err(ServiceError::new(format!(
+                        return Err(ServiceError::unsupported(format!(
                             "read-only: {verb} is not allowed"
                         )));
                     }
+                    let statement = render_command(&tokens);
+                    let metadata = command_metadata(&tokens);
                     let (duration, reply) = this.run_command(&tokens).await?;
                     let (columns, full_rows) = reply_rows(&reply);
                     let truncated = full_rows.len() > MAX_ROWS;
-                    Ok(finalize(columns, full_rows, duration, truncated))
+                    Ok(finalize(
+                        columns,
+                        full_rows,
+                        duration,
+                        truncated,
+                        Some(statement),
+                        Some(metadata),
+                    ))
                 }
             }
         })
@@ -1227,7 +1442,7 @@ impl SessionService for RedisService {
     ) -> ServiceFuture<'static, Vec<ColumnInfo>> {
         Box::pin(async move {
             if request.table != KEYS_TABLE {
-                return Err(ServiceError::new(format!(
+                return Err(ServiceError::unsupported(format!(
                     "unknown table: {}",
                     request.table
                 )));
@@ -1243,7 +1458,7 @@ impl SessionService for RedisService {
     ) -> ServiceFuture<'static, Vec<IndexInfo>> {
         Box::pin(async move {
             if request.table != KEYS_TABLE {
-                return Err(ServiceError::new(format!(
+                return Err(ServiceError::unsupported(format!(
                     "unknown table: {}",
                     request.table
                 )));
@@ -1368,7 +1583,7 @@ impl SessionService for RedisService {
         let this = self.clone();
         Box::pin(async move {
             if request.table != KEYS_TABLE {
-                return Err(ServiceError::new(format!(
+                return Err(ServiceError::unsupported(format!(
                     "unknown table: {}",
                     request.table
                 )));
@@ -1386,23 +1601,41 @@ impl SessionService for RedisService {
     ) -> ServiceFuture<'static, RowWriteResponse> {
         let this = self.clone();
         Box::pin(async move {
-            let (rows_affected, statement) = match parse_row_write(&request)? {
-                RowWrite::Delete { key } => this.delete_row(&key).await?,
+            let (rows_affected, statement, metadata) = match parse_row_write(&request)? {
+                // Key-only DEL: the statement embeds no value, so it is
+                // replayable and non-sensitive.
+                RowWrite::Delete { key } => {
+                    let (affected, statement) = this.delete_row(&key).await?;
+                    (affected, statement, StatementMetadata::redis(true, false))
+                }
                 RowWrite::Update {
                     key,
                     rename_to,
                     value,
                 } => {
-                    this.update_row(&key, rename_to.as_deref(), value.as_deref())
-                        .await?
+                    let (affected, statement) = this
+                        .update_row(&key, rename_to.as_deref(), value.as_deref())
+                        .await?;
+                    // A rename-only update is RENAME-equivalent: the
+                    // reported EVAL embeds keys only. A value change
+                    // embeds the new value in the statement, so it is
+                    // sensitive and non-replayable.
+                    let metadata = if value.is_none() {
+                        StatementMetadata::redis(true, false)
+                    } else {
+                        StatementMetadata::redis(false, true)
+                    };
+                    (affected, statement, metadata)
                 }
-                RowWrite::Insert { key, value } => this.insert_row(&key, &value).await?,
+                RowWrite::Insert { key, value } => {
+                    let (affected, statement) = this.insert_row(&key, &value).await?;
+                    // SET <key> <value> NX embeds the value: sensitive,
+                    // never stored verbatim, never replayed.
+                    (affected, statement, StatementMetadata::redis(false, true))
+                }
             };
             Ok(RowWriteResponse {
-                result: RowsAffected {
-                    rows_affected,
-                    statement,
-                },
+                result: RowsAffected::with_statement(rows_affected, statement, metadata),
             })
         })
     }
@@ -1417,7 +1650,7 @@ impl SessionService for RedisService {
 }
 
 fn fixed_schema_error() -> ServiceError {
-    ServiceError::new("Redis keys has a fixed virtual schema")
+    ServiceError::unsupported("Redis keys has a fixed virtual schema")
 }
 
 // --- factory ------------------------------------------------------------
@@ -1444,10 +1677,10 @@ impl SessionFactory for RedisFactory {
     fn open<'a>(&'a self, target: &'a str) -> OpenFuture<'a> {
         Box::pin(async move {
             let uri = normalize_target(target)?;
-            let parsed =
-                Url::parse(&uri).map_err(|e| ServiceError::new(format!("invalid target: {e}")))?;
+            let parsed = Url::parse(&uri)
+                .map_err(|e| ServiceError::validation(format!("invalid target: {e}")))?;
             if parsed.scheme() != "redis" {
-                return Err(ServiceError::new(
+                return Err(ServiceError::validation(
                     "invalid target: only plain TCP redis:// targets are supported (no TLS)",
                 ));
             }
@@ -1455,23 +1688,23 @@ impl SessionFactory for RedisFactory {
                 .query_pairs()
                 .any(|(k, v)| k == "tls" && matches!(v.as_ref(), "true" | "1" | "secure"))
             {
-                return Err(ServiceError::new(
+                return Err(ServiceError::validation(
                     "invalid target: only plain TCP redis:// targets are supported (no TLS)",
                 ));
             }
             let database = parse_database(&parsed)?;
 
-            let client = redis::Client::open(uri)
-                .map_err(|e| ServiceError::new(format!("invalid target: {e}")))?;
+            let client =
+                redis::Client::open(uri).map_err(|e| map_redis_error(&e, "invalid target: "))?;
             let mut manager = redis::aio::ConnectionManager::new(client)
                 .await
-                .map_err(|e| ServiceError::new(format!("connect failed: {e}")))?;
+                .map_err(|e| map_redis_error(&e, "connect failed: "))?;
 
             let info: String = redis::cmd("INFO")
                 .arg("server")
                 .query_async(&mut manager)
                 .await
-                .map_err(|e| ServiceError::new(format!("connect failed: {e}")))?;
+                .map_err(|e| map_redis_error(&e, "connect failed: "))?;
             let version = info
                 .lines()
                 .find_map(|line| line.strip_prefix("redis_version:").map(str::trim))
@@ -1494,6 +1727,7 @@ impl SessionFactory for RedisFactory {
 mod tests {
     use super::*;
     use crate::dto::write::Value;
+    use crate::protocol::ErrorKind;
 
     #[test]
     fn build_target_uses_defaults_for_blank_fields() {
@@ -2253,5 +2487,355 @@ mod tests {
             "statement: {statement:?}"
         );
         assert_eq!(shell_words::split(&statement).unwrap(), hostile);
+    }
+
+    // --- statement metadata ------------------------------------------------
+
+    fn tokens_of(statement: &str) -> Vec<String> {
+        shell_words::split(statement).unwrap()
+    }
+
+    #[test]
+    fn command_metadata_reads_are_replayable_and_benign() {
+        for statement in [
+            "PING",
+            "GET user:1",
+            "MGET user:1 user:2",
+            "HGETALL user:1",
+            "INFO server",
+            "SCAN 0",
+            "KEYS *",
+            "TTL user:1",
+            "get user:1", // case-insensitive
+        ] {
+            let metadata = command_metadata(&tokens_of(statement));
+            assert!(metadata.replayable, "{statement:?} must be replayable");
+            assert!(!metadata.sensitive, "{statement:?} must not be sensitive");
+            assert_eq!(metadata.language, "redis");
+        }
+    }
+
+    #[test]
+    fn command_metadata_ping_message_is_sensitive_but_bare_ping_is_benign() {
+        // Bare PING is a health check: benign and replayable.
+        let bare = command_metadata(&tokens_of("PING"));
+        assert!(bare.replayable, "bare PING must be replayable");
+        assert!(!bare.sensitive, "bare PING must not be sensitive");
+
+        // PING with any argument embeds an arbitrary payload the server
+        // echoes back: sensitive, never stored verbatim, never replayed
+        // — case-insensitive like every other verb.
+        for statement in [
+            "PING hunter2",
+            "ping secret-message",
+            "PING \"hello world\"",
+            "PING a b",
+        ] {
+            let metadata = command_metadata(&tokens_of(statement));
+            assert!(!metadata.replayable, "{statement:?} must be non-replayable");
+            assert!(metadata.sensitive, "{statement:?} must be sensitive");
+        }
+    }
+
+    #[test]
+    fn command_metadata_ping_discriminates_in_serialized_metadata() {
+        // The serialized statement metadata the host consumes must
+        // discriminate the two PING shapes: the secret payload is
+        // flagged sensitive so the host redacts the text and forces the
+        // entry non-replayable, while the bare health check keeps the
+        // benign defaults.
+        let secret = command_metadata(&tokens_of("PING hunter2"));
+        assert_eq!(
+            serde_json::to_string(&secret).unwrap(),
+            r#"{"language":"redis","replayable":false,"sensitive":true}"#
+        );
+        let bare = command_metadata(&tokens_of("PING"));
+        assert_eq!(
+            serde_json::to_string(&bare).unwrap(),
+            r#"{"language":"redis","replayable":true,"sensitive":false}"#
+        );
+    }
+
+    #[test]
+    fn read_only_allowlist_arguments_are_locators_or_query_parameters() {
+        // Audit guard: every read-only command takes only keys,
+        // patterns, numeric ranges/limits, or an INFO section name —
+        // never a stored value. PING is exercised separately because
+        // its optional message argument is a payload.
+        for statement in [
+            "GET user:1",
+            "MGET user:1 user:2 user:3",
+            "EXISTS user:1 user:2",
+            "TYPE user:1",
+            "TTL user:1",
+            "PTTL user:1",
+            "DBSIZE",
+            "SCAN 0 MATCH user:* COUNT 100 TYPE string",
+            "KEYS user:*",
+            "HGET user:1 field-name",
+            "HGETALL user:1",
+            "HLEN user:1",
+            "SMEMBERS user:1",
+            "SCARD user:1",
+            "ZRANGE user:1 0 -1 BYSCORE REV LIMIT 0 10 WITHSCORES",
+            "ZCARD user:1",
+            "LRANGE user:1 0 -1",
+            "LLEN user:1",
+            "INFO server",
+            "info replication",
+        ] {
+            let metadata = command_metadata(&tokens_of(statement));
+            assert!(
+                metadata.replayable && !metadata.sensitive,
+                "{statement:?} must stay benign: {metadata:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_metadata_key_only_writes_are_replayable_and_benign() {
+        for statement in [
+            "DEL user:1",
+            "RENAME user:1 user:2",
+            "RENAMENX user:1 user:2",
+            "UNLINK user:1",
+            "EXPIRE user:1 60",
+            "PERSIST user:1",
+            "TOUCH user:1",
+            "COPY user:1 user:2",
+            "FLUSHDB",
+            "SELECT 2",
+            "WATCH user:1",
+        ] {
+            let metadata = command_metadata(&tokens_of(statement));
+            assert!(metadata.replayable, "{statement:?} must be replayable");
+            assert!(!metadata.sensitive, "{statement:?} must not be sensitive");
+        }
+    }
+
+    #[test]
+    fn command_metadata_value_bearing_writes_are_sensitive_and_non_replayable() {
+        // The host redacts sensitive statements and forces them
+        // non-replayable: secrets never survive in serialized statement
+        // metadata paths.
+        for statement in [
+            "SET user:1 hunter2",
+            "SET user:1 hunter2 NX",
+            "MSET user:1 a user:2 b",
+            "APPEND user:1 more",
+            "HSET user:1 field value",
+            "LPUSH queue:jobs payload",
+            "SADD tags:demo secret-tag",
+            "ZADD leaderboard:demo 1.5 member",
+            "XADD stream:events * field value",
+            "INCRBY counter 5",
+            "SETBIT bitmap 7 1",
+            "PFADD visitors alice",
+            "GEOADD geo 13.36 38.11 palermo",
+            "PUBLISH channel secret-message",
+            "RESTORE user:1 0 \"payload\"",
+            "ECHO secret",
+        ] {
+            let metadata = command_metadata(&tokens_of(statement));
+            assert!(!metadata.replayable, "{statement:?} must be non-replayable");
+            assert!(metadata.sensitive, "{statement:?} must be sensitive");
+        }
+    }
+
+    #[test]
+    fn command_metadata_credentials_are_sensitive_and_non_replayable() {
+        for statement in [
+            "AUTH hunter2",
+            "AUTH alice hunter2",
+            "HELLO 3 AUTH alice hunter2",
+            "ACL SETUSER alice on >hunter2",
+            "ACL SETUSER alice ~keys:* +@all",
+            "CONFIG SET requirepass hunter2",
+            "CONFIG SET masterauth hunter2",
+            "MIGRATE 10.0.0.1 6379 user:1 0 1000 AUTH hunter2",
+            "MIGRATE 10.0.0.1 6379 \"\" 0 1000 AUTH2 alice hunter2",
+            "EVAL \"return redis.call('SET', KEYS[1], ARGV[1])\" 1 k v",
+            "SCRIPT LOAD \"return 1\"",
+            "FUNCTION LOAD \"#!lua name=mylib\nredis.register_function('f', function() return 1 end)\"",
+        ] {
+            let metadata = command_metadata(&tokens_of(statement));
+            assert!(!metadata.replayable, "{statement:?} must be non-replayable");
+            assert!(metadata.sensitive, "{statement:?} must be sensitive");
+        }
+    }
+
+    #[test]
+    fn command_metadata_unknown_commands_default_sensitive() {
+        // Unknown/module commands may embed payloads: the conservative
+        // default is sensitive and non-replayable unless explicitly
+        // classified safe.
+        for statement in [
+            "JSON.SET user:1 $ \"{\\\"a\\\":1}\"",
+            "FT.CREATE idx ON HASH PREFIX 1 doc:",
+            "BF.ADD bloom member",
+            "TS.ADD sensor:1 * 42",
+            "XINFO STREAM s",
+            "OBJECT ENCODING user:1",
+            "DUMP user:1",
+            "HELLO 3",
+        ] {
+            let metadata = command_metadata(&tokens_of(statement));
+            assert!(!metadata.replayable, "{statement:?} must be non-replayable");
+            assert!(metadata.sensitive, "{statement:?} must default sensitive");
+        }
+    }
+
+    #[test]
+    fn classification_lists_are_disjoint_and_reads_stay_benign() {
+        for verb in SENSITIVE_COMMANDS {
+            assert!(
+                !is_read_only(verb) && !SAFE_WRITE_COMMANDS.contains(verb),
+                "{verb} must live in exactly one classification"
+            );
+        }
+        for verb in SAFE_WRITE_COMMANDS {
+            assert!(
+                !is_read_only(verb) && !SENSITIVE_COMMANDS.contains(verb),
+                "{verb} must live in exactly one classification"
+            );
+        }
+        for verb in READ_ONLY_COMMANDS {
+            assert!(
+                !SENSITIVE_COMMANDS.contains(&verb) && !SAFE_WRITE_COMMANDS.contains(&verb),
+                "{verb} must live in exactly one classification"
+            );
+        }
+    }
+
+    #[test]
+    fn select_statement_is_the_exact_replayable_pseudo_command() {
+        assert_eq!(select_statement(0, None), r#"SELECT * FROM "keys""#);
+        assert_eq!(
+            select_statement(0, Some(25)),
+            r#"SELECT * FROM "keys" LIMIT 25 OFFSET 0"#
+        );
+        // The host-generated form with both clauses parses to exactly
+        // the browse the plugin replays.
+        assert_eq!(
+            parse_statement(r#"SELECT * FROM "keys" LIMIT 25 OFFSET 0"#).unwrap(),
+            Statement::SelectKeys {
+                offset: 0,
+                limit: Some(25)
+            }
+        );
+        assert_eq!(
+            select_statement(5, Some(25)),
+            r#"SELECT * FROM "keys" LIMIT 25 OFFSET 5"#
+        );
+        assert_eq!(
+            select_statement(5, None),
+            r#"SELECT * FROM "keys" OFFSET 5"#
+        );
+        // Every pseudo-command round-trips through the plugin's own
+        // parser as the same virtual browse.
+        for (offset, limit) in [(0, None), (0, Some(25)), (5, Some(25)), (5, None)] {
+            let statement = select_statement(offset, limit);
+            assert_eq!(
+                parse_statement(&statement).unwrap(),
+                Statement::SelectKeys { offset, limit },
+                "statement: {statement:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn advertised_query_language_examples_all_parse() {
+        // Every example the initialize handshake advertises must be
+        // accepted by the plugin's own parser.
+        let capabilities = crate::server::redis_capabilities();
+        let examples = capabilities
+            .query_language
+            .as_ref()
+            .expect("query_language must be advertised")
+            .examples
+            .clone()
+            .expect("examples must be advertised");
+        assert!(
+            (2..=4).contains(&examples.len()),
+            "2-4 examples expected, got {}",
+            examples.len()
+        );
+        for example in &examples {
+            parse_statement(example)
+                .unwrap_or_else(|e| panic!("advertised example {example:?} must parse: {e:?}"));
+        }
+    }
+
+    // --- error classification ---------------------------------------------
+
+    #[test]
+    fn map_redis_error_classifies_auth_connection_and_operation() {
+        // AUTH handshake failure: the crate's dedicated kind.
+        let auth: redis::RedisError =
+            (redis::ErrorKind::AuthenticationFailed, "password mismatch").into();
+        let err = map_redis_error(&auth, "connect failed: ");
+        assert_eq!(err.kind, ErrorKind::Authentication);
+        assert!(
+            err.message.starts_with("connect failed: "),
+            "the safe prefix is preserved: {}",
+            err.message
+        );
+
+        // A server NOAUTH/WRONGPASS reply: extension code in the text.
+        let noauth: redis::RedisError = (
+            redis::ErrorKind::Extension,
+            "NOAUTH Authentication required.",
+        )
+            .into();
+        assert_eq!(
+            map_redis_error(&noauth, "redis: ").kind,
+            ErrorKind::Authentication
+        );
+        let wrongpass: redis::RedisError = (
+            redis::ErrorKind::Extension,
+            "WRONGPASS invalid username-password pair",
+        )
+            .into();
+        assert_eq!(
+            map_redis_error(&wrongpass, "redis: ").kind,
+            ErrorKind::Authentication
+        );
+
+        // Connection refused / dropped connection: I/O.
+        let io: redis::RedisError = (redis::ErrorKind::Io, "connection refused").into();
+        assert_eq!(
+            map_redis_error(&io, "connect failed: ").kind,
+            ErrorKind::Connection
+        );
+
+        // Unparseable client config (bad URL): validation.
+        let config: redis::RedisError = (
+            redis::ErrorKind::InvalidClientConfig,
+            "Redis URL did not parse",
+        )
+            .into();
+        assert_eq!(
+            map_redis_error(&config, "invalid target: ").kind,
+            ErrorKind::Validation
+        );
+
+        // A plain server command error stays an operation error, never
+        // protocol or plugin_crash.
+        let response: redis::RedisError = (
+            redis::ErrorKind::Server(redis::ServerErrorKind::ResponseError),
+            "ERR unknown command 'FOO'",
+        )
+            .into();
+        assert_eq!(
+            map_redis_error(&response, "redis: ").kind,
+            ErrorKind::Operation
+        );
+
+        // Client-side misuse also falls back to operation.
+        let client: redis::RedisError = (redis::ErrorKind::Client, "client misuse").into();
+        assert_eq!(
+            map_redis_error(&client, "redis: ").kind,
+            ErrorKind::Operation
+        );
     }
 }

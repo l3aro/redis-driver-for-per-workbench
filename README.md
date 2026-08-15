@@ -102,8 +102,10 @@ plugin's stdout carries only protocol frames.
    In the TUI, the connection opens straight into the ready state with
    the status bar reporting the Redis product and version (e.g.
    `Redis 7.4.7`). The schema sidebar renders no items for this plugin
-   (see [Schema browsing](#schema-browsing)). The SQL tab is visible in
-   the workspace but the initial focus is the schema pane — press `2`
+   (see [Schema browsing](#schema-browsing)). The query editor tab is
+   labeled **Command** (the plugin advertises `query_language` with
+   name `Redis`, a concrete command placeholder, and example
+   statements) but the initial focus is the schema pane — press `2`
    (focus workspace) to type into the editor.
 
 ## Trying the plugin in the TUI
@@ -153,16 +155,42 @@ database; `rows_affected` reports the real count.
   0/1 deletion count.
 
 Every successful row write reports the **exact native Redis command that
-was executed** as the wire `statement` (the host logs it in the query log
-in place of the generic preview; it never executes the text itself).
+was executed** as the wire `statement`, always paired with
+`statement_metadata` (`{language: "redis", replayable, sensitive}`).
 Inserts log `SET <key> <value> NX`, deletes log `DEL <key>`, and updates
 log `EVAL <script> 1 <key> <dst> <want> <expected> <new>` — the shared
 atomic update script with its exact keys and arguments, never a simpler
 `RENAME`/`SET` whose effects (e.g. overwriting a colliding destination)
 would differ from the guarded operation. Every token is shell-quoted, so
-the logged entry can be pasted into Workbench Execute and replayed
-verbatim; keys and values containing spaces, quotes, backslashes, or
-newlines survive the round trip.
+keys and values containing spaces, quotes, backslashes, or newlines
+survive the round trip.
+
+Sensitivity is conservative: statements that embed a value (inserts,
+value edits, and any native command carrying a payload, credential, or
+script — `SET`/`HSET`/`LPUSH`/…, `AUTH`, `HELLO AUTH`, `ACL SETUSER`,
+`CONFIG` password/auth settings, `MIGRATE AUTH`, `EVAL`, unknown/module
+commands) are flagged **sensitive** and **non-replayable**: the host
+redacts the text and never stores it verbatim. Key-only statements
+(`DEL`, key renames, reads, the virtual browse SELECT) stay
+**non-sensitive** and **replayable**: they can be pasted into Workbench
+Execute and replayed verbatim. There are no descriptive
+`Table:`/`Key:`/`Changes:` previews.
+
+Every successful `execute`/`execute_read_only` result reports the exact
+command the plugin accepted (re-rendered from the parsed tokens) as
+`statement` with the same metadata; every `browse_table` result reports
+the exact pseudo-command (`SELECT * FROM "keys" [LIMIT n] [OFFSET m]`)
+that `execute` replays.
+
+Service errors carry structured provenance on the wire:
+`error.data = {"kind", "plugin": "redis", "method"}` with the stable
+kinds `validation`, `authentication`, `connection`, `operation`,
+`unsupported`, `cancelled` (mirroring the perk/v1 contract). Redis
+credential failures map to `authentication`, connection/open failures
+to `connection`, parse/params/row-write input to `validation`,
+unsupported tables/methods/schema mutations to `unsupported`,
+cancellation to `cancelled`, and everything else to `operation`; the
+advisory `method` is the actual wire method, rendered exactly once.
 
 In the current host the row forms live on the Browse tab, which cannot
 open `keys` because of the schema-sidebar limitation below, so the TUI

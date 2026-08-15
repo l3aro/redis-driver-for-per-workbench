@@ -14,8 +14,9 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
 use perk_redis::dto::request::{BrowseTableRequest, EmptyRequest, StatementRequest, TableRequest};
-use perk_redis::dto::service::{DatabaseInfo, QueryResult};
+use perk_redis::dto::service::{BrowseOptions, DatabaseInfo, QueryResult, StatementMetadata};
 use perk_redis::dto::write::{RowValue, RowWriteRequest, RowWriteResponse, Value};
+use perk_redis::protocol::ErrorKind;
 use perk_redis::redis_service::RedisFactory;
 use perk_redis::service::{ServiceError, SessionFactory, SessionService};
 
@@ -1310,4 +1311,257 @@ async fn row_write_statements_are_native_replayable_commands() {
     );
 
     svc.close();
+}
+
+#[tokio::test]
+async fn execution_results_report_statement_and_metadata() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+
+    // A benign read reports the exact command, replayable and benign.
+    let result = exec_ok(&*svc, "PING").await;
+    assert_eq!(result.statement.as_deref(), Some("PING"));
+    assert_eq!(
+        result.statement_metadata,
+        Some(StatementMetadata::redis(true, false))
+    );
+
+    exec_ok(&*svc, "SET exec-meta v").await;
+    let result = exec_ok(&*svc, "GET exec-meta").await;
+    assert_eq!(result.statement.as_deref(), Some("GET exec-meta"));
+    assert_eq!(
+        result.statement_metadata,
+        Some(StatementMetadata::redis(true, false))
+    );
+
+    // A value-bearing write is flagged sensitive: the host redacts the
+    // statement and forces the entry non-replayable, so the secret
+    // never survives in serialized metadata paths.
+    let result = exec_ok(&*svc, "SET exec-meta hunter2").await;
+    assert_eq!(result.statement.as_deref(), Some("SET exec-meta hunter2"));
+    assert_eq!(
+        result.statement_metadata,
+        Some(StatementMetadata::redis(false, true))
+    );
+
+    // The read-only path reports the same statement and metadata.
+    let result = read_only(&*svc, "GET exec-meta")
+        .await
+        .expect("read-only GET");
+    assert_eq!(result.statement.as_deref(), Some("GET exec-meta"));
+    assert_eq!(
+        result.statement_metadata,
+        Some(StatementMetadata::redis(true, false))
+    );
+
+    // A write through the read-only surface is unsupported.
+    let err = read_only(&*svc, "SET exec-meta x")
+        .await
+        .expect_err("read-only SET must be rejected");
+    assert_eq!(err.kind, ErrorKind::Unsupported);
+
+    // An unknown command is a server operation error, never protocol or
+    // plugin_crash.
+    let err = exec_async(&*svc, "THISCMDDOESNOTEXIST x")
+        .await
+        .expect_err("unknown command must fail");
+    assert_eq!(err.kind, ErrorKind::Operation);
+
+    svc.close();
+}
+
+#[tokio::test]
+async fn browse_and_virtual_select_report_the_replayable_pseudo_command() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+    for key in ["b:1", "a:1", "c:1"] {
+        exec_ok(&*svc, &format!("SET {key} v")).await;
+    }
+
+    // browse_table reports the exact pseudo-command execute can replay.
+    let request = BrowseTableRequest {
+        table: "keys".to_string(),
+        options: BrowseOptions {
+            offset: Some(0),
+            limit: Some(2),
+            ..Default::default()
+        },
+    };
+    let result = svc
+        .browse_table(request, CancellationToken::new())
+        .await
+        .expect("browse must succeed");
+    assert_eq!(
+        result.statement.as_deref(),
+        Some(r#"SELECT * FROM "keys" LIMIT 2 OFFSET 0"#)
+    );
+    assert_eq!(
+        result.statement_metadata,
+        Some(StatementMetadata::redis(true, false))
+    );
+
+    // Executing the host-generated statement reports the same
+    // pseudo-command with its clauses, replayable and benign.
+    let result = exec_ok(&*svc, r#"SELECT * FROM "keys" LIMIT 25 OFFSET 0"#).await;
+    assert_eq!(
+        result.statement.as_deref(),
+        Some(r#"SELECT * FROM "keys" LIMIT 25 OFFSET 0"#)
+    );
+    assert_eq!(
+        result.statement_metadata,
+        Some(StatementMetadata::redis(true, false))
+    );
+    assert_eq!(result.rows.len(), 3);
+
+    svc.close();
+}
+
+/// Runs a row write and returns `(statement, metadata)`.
+async fn row_write_metadata(
+    svc: &dyn SessionService,
+    request: RowWriteRequest,
+) -> (String, StatementMetadata) {
+    let response = row_write(svc, request)
+        .await
+        .unwrap_or_else(|e| panic!("row_write failed: {e:?}"));
+    (
+        response.result.statement,
+        response
+            .result
+            .statement_metadata
+            .expect("every row write pairs its statement with metadata"),
+    )
+}
+
+#[tokio::test]
+async fn row_write_statements_pair_metadata_by_sensitivity() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+
+    // Insert embeds the value: sensitive, non-replayable.
+    let (statement, metadata) = row_write_metadata(&*svc, insert_req("meta-ins", "secret")).await;
+    assert_eq!(statement, "SET meta-ins secret NX");
+    assert_eq!(metadata, StatementMetadata::redis(false, true));
+
+    // A value edit embeds the new value in the EVAL statement.
+    let (_, metadata) = row_write_metadata(
+        &*svc,
+        update_req("meta-ins", vec![cell("value", "secret2")]),
+    )
+    .await;
+    assert_eq!(metadata, StatementMetadata::redis(false, true));
+
+    // A rename-only update is RENAME-equivalent: keys only, replayable.
+    let (_, metadata) = row_write_metadata(
+        &*svc,
+        update_req("meta-ins", vec![cell("key", "meta-renamed")]),
+    )
+    .await;
+    assert_eq!(metadata, StatementMetadata::redis(true, false));
+
+    // Key-only DEL: replayable and benign.
+    let (statement, metadata) = row_write_metadata(&*svc, delete_req("meta-renamed")).await;
+    assert_eq!(statement, "DEL meta-renamed");
+    assert_eq!(metadata, StatementMetadata::redis(true, false));
+
+    svc.close();
+}
+
+#[tokio::test]
+async fn error_kinds_map_auth_connection_validation_and_unsupported() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+
+    // Wrong credentials: authentication, before any session exists.
+    let mut bad = url::Url::parse(&url).expect("REDIS_URL must parse");
+    bad.set_password(Some("wrong-password"))
+        .expect("set password");
+    let err = match RedisFactory::default().open(bad.as_str()).await {
+        Err(e) => e,
+        Ok(_) => panic!("wrong password must fail open"),
+    };
+    assert_eq!(err.kind, ErrorKind::Authentication, "{}", err.message);
+
+    // An unreachable port: connection.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind probe");
+    let port = listener.local_addr().expect("probe address").port();
+    drop(listener);
+    let err = match RedisFactory::default()
+        .open(&format!("redis://127.0.0.1:{port}/0"))
+        .await
+    {
+        Err(e) => e,
+        Ok(_) => panic!("closed port must fail open"),
+    };
+    assert_eq!(err.kind, ErrorKind::Connection, "{}", err.message);
+
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+
+    // Malformed statements and malformed row-write input: validation.
+    let err = validate(&*svc, "SET unclosed 'quote")
+        .await
+        .expect_err("malformed statement must be rejected");
+    assert_eq!(err.kind, ErrorKind::Validation, "{}", err.message);
+    let err = row_write(
+        &*svc,
+        RowWriteRequest {
+            operation: "upsert".to_string(),
+            table: "keys".to_string(),
+            key: None,
+            values: None,
+        },
+    )
+    .await
+    .expect_err("unknown operation must be rejected");
+    assert_eq!(err.kind, ErrorKind::Validation, "{}", err.message);
+
+    // Unknown table on a schema RPC: unsupported.
+    let err = svc
+        .table_info(
+            TableRequest {
+                table: "nope".to_string(),
+            },
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("unknown table must be rejected");
+    assert_eq!(err.kind, ErrorKind::Unsupported, "{}", err.message);
+    let err = row_write(&*svc, insert_req("x", "v"))
+        .await
+        .expect("collision-free insert") // inserted fine; now target another table
+        .result
+        .rows_affected;
+    assert_eq!(err, 1);
+    let mut bad_table = insert_req("x2", "v");
+    bad_table.table = "nope".to_string();
+    let err = row_write(&*svc, bad_table)
+        .await
+        .expect_err("unknown write table must be rejected");
+    assert_eq!(err.kind, ErrorKind::Unsupported, "{}", err.message);
+
+    // A closed session reports connection errors.
+    svc.close();
+    let err = exec_async(&*svc, "PING")
+        .await
+        .expect_err("closed session must fail");
+    assert_eq!(err.kind, ErrorKind::Connection, "{}", err.message);
 }

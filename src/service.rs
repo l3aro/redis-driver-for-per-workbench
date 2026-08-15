@@ -22,7 +22,7 @@ use crate::dto::service::{
     SchemaObject,
 };
 use crate::dto::write::{RowValue, RowWriteRequest, RowWriteResponse, RowsAffected};
-use crate::protocol::ERR_CANCELED;
+use crate::protocol::{ERR_CANCELED, ERR_INVALID_PARAMS, ERR_METHOD_NOT_FOUND, ErrorKind};
 
 pub type ServiceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, ServiceError>> + Send + 'a>>;
 
@@ -37,32 +37,88 @@ pub type OpenFuture<'a> = Pin<
 >;
 
 /// Handler error. `code: None` becomes the JSON-RPC internal error
-/// (-32603); a present code is used as-is (e.g. -32800 canceled).
+/// (-32603); a present code is used as-is (e.g. -32800 canceled). Every
+/// error carries a normalized [`ErrorKind`], serialized into the
+/// structured `data` provenance of the response (kind + plugin + wire
+/// method); the kind never leaks into the message.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceError {
     pub code: Option<i32>,
     pub message: String,
+    pub kind: ErrorKind,
 }
 
 impl ServiceError {
+    /// Generic operation failure: the fallback kind.
     pub fn new(message: impl Into<String>) -> Self {
         Self {
             code: None,
             message: message.into(),
+            kind: ErrorKind::Operation,
         }
     }
 
-    pub fn with_code(code: i32, message: impl Into<String>) -> Self {
+    /// The operation was rejected as invalid (parse, params, schema,
+    /// or row-write input).
+    pub fn validation(message: impl Into<String>) -> Self {
         Self {
-            code: Some(code),
+            code: None,
             message: message.into(),
+            kind: ErrorKind::Validation,
         }
     }
 
+    /// Credentials were missing or rejected.
+    pub fn authentication(message: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            message: message.into(),
+            kind: ErrorKind::Authentication,
+        }
+    }
+
+    /// The backend connection failed or dropped.
+    pub fn connection(message: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            message: message.into(),
+            kind: ErrorKind::Connection,
+        }
+    }
+
+    /// The backend does not support the operation.
+    pub fn unsupported(message: impl Into<String>) -> Self {
+        Self {
+            code: None,
+            message: message.into(),
+            kind: ErrorKind::Unsupported,
+        }
+    }
+
+    /// The operation was canceled: -32800, the perk/v1 cancellation code.
     pub fn canceled(message: impl Into<String>) -> Self {
         Self {
             code: Some(ERR_CANCELED),
             message: message.into(),
+            kind: ErrorKind::Cancelled,
+        }
+    }
+
+    /// Invalid params: -32602 plus the validation kind.
+    pub fn invalid_params(message: impl Into<String>) -> Self {
+        Self {
+            code: Some(ERR_INVALID_PARAMS),
+            message: message.into(),
+            kind: ErrorKind::Validation,
+        }
+    }
+
+    /// Method not found: -32601 plus the unsupported kind.
+    pub fn method_not_found(message: impl Into<String>) -> Self {
+        Self {
+            code: Some(ERR_METHOD_NOT_FOUND),
+            message: message.into(),
+            kind: ErrorKind::Unsupported,
         }
     }
 
@@ -216,6 +272,8 @@ fn stub_result(
         duration_ns: 0,
         truncated: false,
         document_ids: None,
+        statement: None,
+        statement_metadata: None,
     }
 }
 
@@ -247,11 +305,11 @@ async fn execute_statement(
     match verb.as_str() {
         "SET" => {
             if !writable {
-                return Err(ServiceError::new("read-only: SET is not allowed"));
+                return Err(ServiceError::unsupported("read-only: SET is not allowed"));
             }
             let key = parts
                 .next()
-                .ok_or_else(|| ServiceError::new("SET requires a key"))?;
+                .ok_or_else(|| ServiceError::validation("SET requires a key"))?;
             let value = parts.collect::<Vec<_>>().join(" ");
             store.lock().unwrap().insert(key.to_string(), value);
             Ok(stub_result(&[], vec![], 1))
@@ -259,7 +317,7 @@ async fn execute_statement(
         "GET" => {
             let key = parts
                 .next()
-                .ok_or_else(|| ServiceError::new("GET requires a key"))?;
+                .ok_or_else(|| ServiceError::validation("GET requires a key"))?;
             let value = store.lock().unwrap().get(key).cloned();
             let rows = match value {
                 Some(v) => vec![vec![Some(key.to_string()), Some(v)]],
@@ -269,11 +327,11 @@ async fn execute_statement(
         }
         "DEL" => {
             if !writable {
-                return Err(ServiceError::new("read-only: DEL is not allowed"));
+                return Err(ServiceError::unsupported("read-only: DEL is not allowed"));
             }
             let key = parts
                 .next()
-                .ok_or_else(|| ServiceError::new("DEL requires a key"))?;
+                .ok_or_else(|| ServiceError::validation("DEL requires a key"))?;
             let removed = store.lock().unwrap().remove(key).is_some();
             Ok(stub_result(&[], vec![], u64::from(removed)))
         }
@@ -290,7 +348,7 @@ async fn execute_statement(
                 }
             }
         }
-        _ => Err(ServiceError::new(format!(
+        _ => Err(ServiceError::unsupported(format!(
             "unsupported statement: {statement}"
         ))),
     }
@@ -300,13 +358,13 @@ async fn execute_statement(
 /// Value kind is rejected, mirroring the Redis service's rules.
 fn memory_string_cell(cell: &RowValue) -> Result<String, ServiceError> {
     if cell.value.kind != "string" {
-        return Err(ServiceError::new(format!(
+        return Err(ServiceError::validation(format!(
             "column {} must be a string value (got {} kind)",
             cell.name, cell.value.kind
         )));
     }
     cell.value.string.clone().ok_or_else(|| {
-        ServiceError::new(format!(
+        ServiceError::validation(format!(
             "column {}: string kind without a payload",
             cell.name
         ))
@@ -318,22 +376,22 @@ fn memory_string_cell(cell: &RowValue) -> Result<String, ServiceError> {
 /// destination is rejected as empty.
 fn memory_identity(cells: Option<&[RowValue]>) -> Result<String, ServiceError> {
     let Some(cells) = cells else {
-        return Err(ServiceError::new("missing key fields"));
+        return Err(ServiceError::validation("missing key fields"));
     };
     let mut found: Option<String> = None;
     for cell in cells {
         if cell.name != "key" {
-            return Err(ServiceError::new(format!(
+            return Err(ServiceError::validation(format!(
                 "unknown key column: {}",
                 cell.name
             )));
         }
         if found.is_some() {
-            return Err(ServiceError::new("duplicate key fields"));
+            return Err(ServiceError::validation("duplicate key fields"));
         }
         found = Some(memory_string_cell(cell)?);
     }
-    found.ok_or_else(|| ServiceError::new("missing key fields"))
+    found.ok_or_else(|| ServiceError::validation("missing key fields"))
 }
 
 /// The changed-column list of a memory-double update: optional `key`
@@ -342,7 +400,7 @@ fn memory_update_fields(
     cells: Option<&[RowValue]>,
 ) -> Result<(Option<String>, Option<String>), ServiceError> {
     let Some(cells) = cells else {
-        return Err(ServiceError::new("update requires a values payload"));
+        return Err(ServiceError::validation("update requires a values payload"));
     };
     let mut rename_to: Option<String> = None;
     let mut value: Option<String> = None;
@@ -350,27 +408,29 @@ fn memory_update_fields(
         match cell.name.as_str() {
             "key" => {
                 if rename_to.is_some() {
-                    return Err(ServiceError::new("duplicate column: key"));
+                    return Err(ServiceError::validation("duplicate column: key"));
                 }
                 let dst = memory_string_cell(cell)?;
                 if dst.is_empty() {
-                    return Err(ServiceError::new("rename destination must not be empty"));
+                    return Err(ServiceError::validation(
+                        "rename destination must not be empty",
+                    ));
                 }
                 rename_to = Some(dst);
             }
             "value" => {
                 if value.is_some() {
-                    return Err(ServiceError::new("duplicate column: value"));
+                    return Err(ServiceError::validation("duplicate column: value"));
                 }
                 value = Some(memory_string_cell(cell)?);
             }
             other => {
-                return Err(ServiceError::new(format!("unknown column: {other}")));
+                return Err(ServiceError::validation(format!("unknown column: {other}")));
             }
         }
     }
     if rename_to.is_none() && value.is_none() {
-        return Err(ServiceError::new(
+        return Err(ServiceError::validation(
             "update requires at least one column change",
         ));
     }
@@ -381,7 +441,7 @@ fn memory_update_fields(
 /// `value` (defaults to the empty string).
 fn memory_insert_fields(cells: Option<&[RowValue]>) -> Result<(String, String), ServiceError> {
     let Some(cells) = cells else {
-        return Err(ServiceError::new("insert requires a values payload"));
+        return Err(ServiceError::validation("insert requires a values payload"));
     };
     let mut key: Option<String> = None;
     let mut value: Option<String> = None;
@@ -389,22 +449,22 @@ fn memory_insert_fields(cells: Option<&[RowValue]>) -> Result<(String, String), 
         match cell.name.as_str() {
             "key" => {
                 if key.is_some() {
-                    return Err(ServiceError::new("duplicate column: key"));
+                    return Err(ServiceError::validation("duplicate column: key"));
                 }
                 key = Some(memory_string_cell(cell)?);
             }
             "value" => {
                 if value.is_some() {
-                    return Err(ServiceError::new("duplicate column: value"));
+                    return Err(ServiceError::validation("duplicate column: value"));
                 }
                 value = Some(memory_string_cell(cell)?);
             }
             other => {
-                return Err(ServiceError::new(format!("unknown column: {other}")));
+                return Err(ServiceError::validation(format!("unknown column: {other}")));
             }
         }
     }
-    let key = key.ok_or_else(|| ServiceError::new("insert requires a key column"))?;
+    let key = key.ok_or_else(|| ServiceError::validation("insert requires a key column"))?;
     Ok((key, value.unwrap_or_default()))
 }
 
@@ -502,7 +562,7 @@ impl SessionService for MemoryService {
         _cancel: CancellationToken,
     ) -> ServiceFuture<'static, ()> {
         Box::pin(async {
-            Err(ServiceError::new(
+            Err(ServiceError::unsupported(
                 "the demo store has a fixed primary index",
             ))
         })
@@ -514,7 +574,7 @@ impl SessionService for MemoryService {
         _cancel: CancellationToken,
     ) -> ServiceFuture<'static, ()> {
         Box::pin(async {
-            Err(ServiceError::new(
+            Err(ServiceError::unsupported(
                 "the demo store has a fixed primary index",
             ))
         })
@@ -526,7 +586,7 @@ impl SessionService for MemoryService {
         _cancel: CancellationToken,
     ) -> ServiceFuture<'static, ()> {
         Box::pin(async {
-            Err(ServiceError::new(
+            Err(ServiceError::unsupported(
                 "the demo store has a fixed primary index",
             ))
         })
@@ -581,7 +641,11 @@ impl SessionService for MemoryService {
         _request: ForeignKeyChangeRequest,
         _cancel: CancellationToken,
     ) -> ServiceFuture<'static, ()> {
-        Box::pin(async { Err(ServiceError::new("the demo store has no foreign keys")) })
+        Box::pin(async {
+            Err(ServiceError::unsupported(
+                "the demo store has no foreign keys",
+            ))
+        })
     }
 
     fn replace_foreign_key(
@@ -589,7 +653,11 @@ impl SessionService for MemoryService {
         _request: ReplaceForeignKeyRequest,
         _cancel: CancellationToken,
     ) -> ServiceFuture<'static, ()> {
-        Box::pin(async { Err(ServiceError::new("the demo store has no foreign keys")) })
+        Box::pin(async {
+            Err(ServiceError::unsupported(
+                "the demo store has no foreign keys",
+            ))
+        })
     }
 
     fn drop_foreign_key(
@@ -597,7 +665,11 @@ impl SessionService for MemoryService {
         _request: DropRequest,
         _cancel: CancellationToken,
     ) -> ServiceFuture<'static, ()> {
-        Box::pin(async { Err(ServiceError::new("the demo store has no foreign keys")) })
+        Box::pin(async {
+            Err(ServiceError::unsupported(
+                "the demo store has no foreign keys",
+            ))
+        })
     }
 
     fn alter_column(
@@ -605,7 +677,11 @@ impl SessionService for MemoryService {
         _request: ColumnChangeRequest,
         _cancel: CancellationToken,
     ) -> ServiceFuture<'static, ()> {
-        Box::pin(async { Err(ServiceError::new("the demo store has a fixed schema")) })
+        Box::pin(async {
+            Err(ServiceError::unsupported(
+                "the demo store has a fixed schema",
+            ))
+        })
     }
 
     fn drop_column(
@@ -613,7 +689,11 @@ impl SessionService for MemoryService {
         _request: DropRequest,
         _cancel: CancellationToken,
     ) -> ServiceFuture<'static, ()> {
-        Box::pin(async { Err(ServiceError::new("the demo store has a fixed schema")) })
+        Box::pin(async {
+            Err(ServiceError::unsupported(
+                "the demo store has a fixed schema",
+            ))
+        })
     }
 
     fn add_column(
@@ -621,7 +701,11 @@ impl SessionService for MemoryService {
         _request: AddColumnRequest,
         _cancel: CancellationToken,
     ) -> ServiceFuture<'static, ()> {
-        Box::pin(async { Err(ServiceError::new("the demo store has a fixed schema")) })
+        Box::pin(async {
+            Err(ServiceError::unsupported(
+                "the demo store has a fixed schema",
+            ))
+        })
     }
 
     fn browse_table(
@@ -664,7 +748,7 @@ impl SessionService for MemoryService {
         let store = self.store.clone();
         Box::pin(async move {
             if request.table != "kv" {
-                return Err(ServiceError::new(format!(
+                return Err(ServiceError::unsupported(format!(
                     "unknown table: {}",
                     request.table
                 )));
@@ -711,7 +795,7 @@ impl SessionService for MemoryService {
                     u64::from(store.lock().unwrap().remove(&identity).is_some())
                 }
                 other => {
-                    return Err(ServiceError::new(format!(
+                    return Err(ServiceError::validation(format!(
                         "unsupported row_write operation: {other}"
                     )));
                 }
@@ -722,6 +806,7 @@ impl SessionService for MemoryService {
                     // The in-memory double is a transport fixture, not a
                     // real backend: no native statement to report.
                     statement: String::new(),
+                    statement_metadata: None,
                 },
             })
         })
