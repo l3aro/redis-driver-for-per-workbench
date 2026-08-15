@@ -1,0 +1,15 @@
+[package]
+name = "perk-redis"
+version = "0.1.0"
+description = "Redis database plugin for perk-workbench speaking the perk/v1 protocol"
+edition = "2024"
+
+[dependencies]
+redis = { version = "1.5.0", features = ["tokio-comp", "connection-manager"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+shell-words = "1.1.1"
+thiserror = "2.0.20"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "io-std", "io-util", "sync", "time"] }
+tokio-util = { version = "0.7.19", features = ["rt"] }
+url = "2.5.8"
