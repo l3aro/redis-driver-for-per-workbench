@@ -1,0 +1,23 @@
+# Reproducible Redis fixture for the perk-redis plugin demo and tests.
+#
+# - Published ONLY on loopback: 127.0.0.1:6380 (container port 6379).
+#   Nothing listens on a non-local interface.
+# - requirepass workbench-demo: every client (seed, tests, the workbench
+#   connection) authenticates explicitly.
+# - Append-only file disabled (--appendonly no): the fixture is
+#   ephemeral by design. The seed script is idempotent, so data can be
+#   recreated on demand; `docker compose down --volumes` wipes it all.
+# - Healthcheck is an authenticated redis-cli PING so `docker compose up
+#   -d --wait` only returns once the server answers with the password.
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "127.0.0.1:6380:6379"
+    command: ["redis-server", "--requirepass", "workbench-demo", "--appendonly", "no"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "workbench-demo", "--no-auth-warning", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+      start_period: 5s
