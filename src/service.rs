@@ -11,11 +11,11 @@ use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::dto::capabilities::FormValues;
+use crate::dto::capabilities::{FormValues, WorkspaceViewScope};
 use crate::dto::request::{
     AddColumnRequest, BrowseTableRequest, BuildTargetResult, ColumnChangeRequest, DropRequest,
     EmptyRequest, ForeignKeyChangeRequest, IndexChangeRequest, ReplaceForeignKeyRequest,
-    ReplaceIndexRequest, StatementRequest, TableRequest,
+    ReplaceIndexRequest, StatementRequest, TableRequest, WorkspaceViewRequest,
 };
 use crate::dto::service::{
     ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, QueryResult, ReferencingForeignKeyInfo,
@@ -276,6 +276,17 @@ pub trait SessionService: Send + Sync {
         request: RowWriteRequest,
         cancel: CancellationToken,
     ) -> ServiceFuture<'static, RowWriteResponse>;
+    /// Optional `perk/v1/workspace_view` handler: one advertised custom
+    /// workspace view for the active structured target, answering
+    /// bounded table data (500 rows / 300 runes per cell). Services that
+    /// do not advertise `workspace.custom_views` may stub it; the
+    /// transport never routes to it then. Unknown view ids and scopes
+    /// the view does not serve are rejected with the stable kinds.
+    fn workspace_view(
+        &self,
+        request: WorkspaceViewRequest,
+        cancel: CancellationToken,
+    ) -> ServiceFuture<'static, QueryResult>;
     /// Close hook. The server removes the session before calling this, so
     /// a failing hook can never resurrect the session.
     fn close(&self);
@@ -537,12 +548,20 @@ impl SessionService for MemoryService {
         let name = self.name.clone();
         let row_count = self.store.lock().unwrap().len() as u64;
         Box::pin(async move {
-            Ok(vec![SchemaObject {
-                database: name,
-                type_: "table".to_string(),
-                name: "kv".to_string(),
-                row_count: Some(row_count),
-            }])
+            Ok(vec![
+                SchemaObject {
+                    database: name.clone(),
+                    type_: "database".to_string(),
+                    name: name.clone(),
+                    row_count: Some(row_count),
+                },
+                SchemaObject {
+                    database: name,
+                    type_: "table".to_string(),
+                    name: "kv".to_string(),
+                    row_count: Some(row_count),
+                },
+            ])
         })
     }
 
@@ -843,6 +862,54 @@ impl SessionService for MemoryService {
                     statement_metadata: None,
                 },
             })
+        })
+    }
+
+    fn workspace_view(
+        &self,
+        request: WorkspaceViewRequest,
+        cancel: CancellationToken,
+    ) -> ServiceFuture<'static, QueryResult> {
+        let store = self.store.clone();
+        Box::pin(async move {
+            // The blocking view id mirrors the SLEEP statement: it
+            // aborts on cancellation so the transport tests can prove
+            // workspace_view rides the same cancel path as every other
+            // session RPC.
+            if request.view_id == "block" {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        return Err(ServiceError::canceled("request canceled"));
+                    }
+                    _ = tokio::time::sleep(Duration::from_millis(60_000)) => {}
+                }
+            }
+            if request.view_id != "server" {
+                return Err(ServiceError::unsupported(format!(
+                    "unknown view: {}",
+                    request.view_id
+                )));
+            }
+            match request.target.kind {
+                WorkspaceViewScope::Database | WorkspaceViewScope::Table => {}
+                WorkspaceViewScope::Schema => {
+                    return Err(ServiceError::unsupported(
+                        "view server is not available for schema targets",
+                    ));
+                }
+            }
+            let keys = store.lock().unwrap().len() as u64;
+            Ok(stub_result(
+                &["Field", "Value"],
+                vec![
+                    vec![Some("keyspace.keys".to_string()), Some(keys.to_string())],
+                    vec![
+                        Some("server.redis_version".to_string()),
+                        Some("7.4.7".to_string()),
+                    ],
+                ],
+                0,
+            ))
         })
     }
 

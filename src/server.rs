@@ -25,7 +25,8 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
 use crate::dto::capabilities::{
-    Capabilities, FormField, FormSpec, QueryCommand, QueryLanguage, TargetPattern,
+    Capabilities, CustomWorkspaceView, FormField, FormSpec, QueryCommand, QueryLanguage,
+    TargetPattern, WorkspaceCapability, WorkspaceStandardTab, WorkspaceViewScope,
     WriteCapabilities,
 };
 use crate::dto::request::{CancelRequest, CloseRequest, OpenRequest, OpenResult};
@@ -40,8 +41,8 @@ use crate::service::{ServiceError, SessionFactory, SessionService};
 /// successful `perk/v1/initialize` handshake overrides it.
 const PLUGIN: &str = "redis";
 
-/// The 20 mandatory session methods.
-const SESSION_METHODS: [&str; 20] = [
+/// The 21 mandatory session methods.
+const SESSION_METHODS: [&str; 21] = [
     "perk/v1/execute",
     "perk/v1/execute_read_only",
     "perk/v1/validate",
@@ -62,6 +63,7 @@ const SESSION_METHODS: [&str; 20] = [
     "perk/v1/drop_column",
     "perk/v1/add_column",
     "perk/v1/browse_table",
+    "perk/v1/workspace_view",
 ];
 
 /// The static command catalog the query editor completes from. Usage
@@ -178,6 +180,24 @@ fn redis_query_language() -> QueryLanguage {
     }
 }
 
+/// The workspace tab advertisement: the explicit standard-tab policy and
+/// the driver-owned `server` view. The advertisement is authoritative —
+/// Redis keeps the useful Columns tab on its virtual `keys` table but
+/// omits Indexes, Foreign Keys, and Diagram (a key-value store has no
+/// relations), while Query and Browse stay host-owned. One custom view,
+/// `server`, serves database and table scopes with bounded INFO-derived
+/// metrics (see [`crate::redis_service::RedisService::workspace_view`]).
+fn redis_workspace() -> WorkspaceCapability {
+    WorkspaceCapability {
+        standard_tabs: Some(vec![WorkspaceStandardTab::Columns]),
+        custom_views: Some(vec![CustomWorkspaceView {
+            id: "server".to_string(),
+            label: "Server".to_string(),
+            scopes: vec![WorkspaceViewScope::Database, WorkspaceViewScope::Table],
+        }]),
+    }
+}
+
 /// The Redis plugin advertisement for the perk/v1 handshake.
 pub fn redis_capabilities() -> Capabilities {
     Capabilities {
@@ -253,6 +273,7 @@ pub fn redis_capabilities() -> Capabilities {
             row_writer: true,
             document: None,
         },
+        workspace: Some(redis_workspace()),
     }
 }
 
@@ -740,7 +761,7 @@ async fn run_session_method(
     use crate::dto::request::{
         AddColumnRequest, BrowseTableRequest, ColumnChangeRequest, DropRequest, EmptyRequest,
         ForeignKeyChangeRequest, IndexChangeRequest, ReplaceForeignKeyRequest, ReplaceIndexRequest,
-        StatementRequest, TableRequest,
+        StatementRequest, TableRequest, WorkspaceViewRequest,
     };
     use crate::dto::write::RowWriteRequest;
     match method {
@@ -781,6 +802,10 @@ async fn run_session_method(
         "perk/v1/drop_column" => call!(DropRequest, drop_column),
         "perk/v1/add_column" => call!(AddColumnRequest, add_column),
         "perk/v1/browse_table" => call!(BrowseTableRequest, browse_table),
+        // workspace_view carries `{session_id, view_id, target}`; the
+        // handler params are `{view_id, target}` after the session_id
+        // strip, exactly the WorkspaceViewRequest shape.
+        "perk/v1/workspace_view" => call!(WorkspaceViewRequest, workspace_view),
         _ => Err(ServiceError::method_not_found(format!(
             "method not found: {method}"
         ))),
@@ -1098,6 +1123,12 @@ mod tests {
                             {"name": "ZADD", "usage": "ZADD key score member [score member ...]", "summary": "Add one or more scored members to the sorted set at key"},
                             {"name": "SCAN", "usage": "SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]", "summary": "Incrementally iterate over the keys in the database"},
                             {"name": "SELECT", "usage": "SELECT index | SELECT * FROM \"keys\" [LIMIT n] [OFFSET m]", "summary": "Select the logical database, or query the virtual keys table"}
+                        ]
+                    },
+                    "workspace": {
+                        "standard_tabs": ["columns"],
+                        "custom_views": [
+                            {"id": "server", "label": "Server", "scopes": ["database", "table"]}
                         ]
                     }
                 }
@@ -1506,6 +1537,106 @@ mod tests {
         assert_error(&response, ERR_METHOD_NOT_FOUND);
         assert_provenance(&response, "unsupported", "perk/v1/document_write");
 
+        h.finish().await.expect("clean EOF exit");
+    }
+
+    #[tokio::test]
+    async fn workspace_view_routes_end_to_end_and_rejects_unknown_views() {
+        let mut h = Harness::start().await;
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"perk/v1/initialize","params":{"protocol_version":1,"workbench_version":"x"}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(
+            response["result"]["capabilities"]["workspace"],
+            json!({
+                "standard_tabs": ["columns"],
+                "custom_views": [
+                    {"id": "server", "label": "Server", "scopes": ["database", "table"]}
+                ]
+            }),
+            "the workspace advertisement must be on the wire"
+        );
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"perk/v1/open","params":{"target":"t"}}"#)
+            .await;
+        h.response().await;
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"perk/v1/execute","params":{"session_id":1,"statement":"SET k1 v1"}}"#)
+            .await;
+        h.response().await;
+
+        // Table target: the view answers the two-column Field/Value shape.
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"perk/v1/workspace_view","params":{"session_id":1,"view_id":"server","target":{"kind":"table","database":"t","table":"kv"}}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["id"], json!(4));
+        assert_eq!(
+            response["result"]["columns"],
+            json!(["Field", "Value"]),
+            "columns: {response}"
+        );
+        assert_eq!(
+            response["result"]["rows"],
+            json!([["keyspace.keys", "1"], ["server.redis_version", "7.4.7"]]),
+            "sorted deterministic rows: {response}"
+        );
+
+        // Database target serves the same view.
+        h.send(r#"{"jsonrpc":"2.0","id":5,"method":"perk/v1/workspace_view","params":{"session_id":1,"view_id":"server","target":{"kind":"database","database":"t"}}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["id"], json!(5));
+        assert_eq!(
+            response["result"]["rows"][1][0],
+            json!("server.redis_version")
+        );
+
+        // Unknown view id is an unsupported-kind operation error, not a
+        // -32602: the params decode fine.
+        h.send(r#"{"jsonrpc":"2.0","id":6,"method":"perk/v1/workspace_view","params":{"session_id":1,"view_id":"frobnicate","target":{"kind":"table","database":"t","table":"kv"}}}"#)
+            .await;
+        let response = h.response().await;
+        assert_error(&response, ERR_INTERNAL);
+        assert_provenance(&response, "unsupported", "perk/v1/workspace_view");
+
+        // Unsupported scope kind is the same stable error shape.
+        h.send(r#"{"jsonrpc":"2.0","id":7,"method":"perk/v1/workspace_view","params":{"session_id":1,"view_id":"server","target":{"kind":"schema","database":"t","schema":"public"}}}"#)
+            .await;
+        let response = h.response().await;
+        assert_error(&response, ERR_INTERNAL);
+        assert_provenance(&response, "unsupported", "perk/v1/workspace_view");
+
+        // Params that do not decode are -32602 like every other RPC.
+        h.send(r#"{"jsonrpc":"2.0","id":8,"method":"perk/v1/workspace_view","params":{"session_id":1,"view_id":42}}"#)
+            .await;
+        let response = h.response().await;
+        assert_error(&response, ERR_INVALID_PARAMS);
+        assert_provenance(&response, "validation", "perk/v1/workspace_view");
+        h.finish().await.expect("clean EOF exit");
+    }
+
+    #[tokio::test]
+    async fn cancel_aborts_a_blocking_workspace_view_with_32800() {
+        let mut h = Harness::start().await;
+        h.send(r#"{"jsonrpc":"2.0","id":1,"method":"perk/v1/initialize","params":{"protocol_version":1,"workbench_version":"x"}}"#)
+            .await;
+        h.response().await;
+        h.send(r#"{"jsonrpc":"2.0","id":2,"method":"perk/v1/open","params":{"target":"redis://localhost:6379/0"}}"#)
+            .await;
+        h.response().await;
+        // Blocking view handler: would sleep a minute to finish.
+        h.send(r#"{"jsonrpc":"2.0","id":3,"method":"perk/v1/workspace_view","params":{"session_id":1,"view_id":"block","target":{"kind":"database","database":"t"}}}"#)
+            .await;
+        // Cancel carries the original request id as a notification.
+        h.send(r#"{"jsonrpc":"2.0","method":"perk/v1/cancel","params":{"id":3}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["id"], json!(3), "canceled request id: {response}");
+        assert_error(&response, ERR_CANCELED);
+        assert_provenance(&response, "cancelled", "perk/v1/workspace_view");
+        // The transport stays live after cancellation: close the session.
+        h.send(r#"{"jsonrpc":"2.0","id":4,"method":"perk/v1/close","params":{"session_id":1}}"#)
+            .await;
+        let response = h.response().await;
+        assert_eq!(response["result"], Value::Null);
         h.finish().await.expect("clean EOF exit");
     }
 

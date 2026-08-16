@@ -101,8 +101,9 @@ plugin's stdout carries only protocol frames.
 
    In the TUI, the connection opens straight into the ready state with
    the status bar reporting the Redis product and version (e.g.
-   `Redis 7.4.7`). The schema sidebar renders no items for this plugin
-   (see [Schema browsing](#schema-browsing)). The query editor tab is
+   `Redis 7.4.7`). The schema sidebar renders the selected logical
+   database root (`db2`) with the virtual `keys` table under it. The
+   query editor tab is
    labeled **Command** (the plugin advertises `query_language` with
    name `Redis`, a concrete command placeholder, example statements,
    and a static command catalog) but the initial focus is the schema
@@ -128,6 +129,13 @@ plugin's stdout carries only protocol frames.
   clauses, malformed quoting) stay operation errors, and native Redis
   commands — including the `SELECT <db>` connection command — are
   unchanged.
+- **Server tab** — open `keys` in the sidebar (Enter), then press `2`
+  (focus workspace) and `L` until the **Server** tab is active (or
+  click it). The workspace tab row shows Command, Browse, Columns, and
+  Server — no Indexes, Foreign Keys, or Diagram — and the Server tab
+  loads the native INFO-derived `Field`/`Value` table: `server.*` and
+  `memory.*` metrics plus the selected database's `keyspace.*` counts
+  (see [Workspace tabs](#workspace-tabs)).
 
 Quit with `Ctrl+C` (or `Ctrl+Q` → Quit when the SQL editor holds text).
 
@@ -196,35 +204,68 @@ unsupported tables/methods/schema mutations to `unsupported`,
 cancellation to `cancelled`, and everything else to `operation`; the
 advisory `method` is the actual wire method, rendered exactly once.
 
-In the current host the row forms live on the Browse tab, which cannot
-open `keys` because of the schema-sidebar limitation below, so the TUI
-path for writes is still the SQL editor (`SET`/`DEL`/`RENAME`). The
-row-write RPC itself is exercised end-to-end by the integration tests;
-collection **value** editing is deliberately unsupported.
-
 ## Schema browsing
 
-The plugin's `perk/v1/list_schema` serves exactly one virtual table —
-`keys` under database `db2` — with key, type, and value-preview columns,
-and `browse_table` pages over it (covered by
-`tests/redis_integration.rs::virtual_keys_schema_and_browse_paging`).
-The **current host does not render that response in the schema
-sidebar**, and no perk/v1 field or host option can change that without
-modifying the host:
+The plugin's `perk/v1/list_schema` serves one selectable database root —
+`dbN` for the selected logical database — with the virtual `keys` table
+under it (key, type, and value-preview columns; `browse_table` pages over
+it, covered by
+`tests/redis_integration.rs::virtual_keys_schema_and_browse_paging`). The
+host builds sidebar roots from `type: "database"` objects and expands
+every root for non-relational products, so a fresh connection shows
+`db2` → `keys` in the schema pane; opening `keys` selects the table in
+the workspace. (The root itself is expand-only for this plugin: the host
+gates database-scope targets to MySQL/MongoDB/PostgreSQL products, so a
+Redis connection never opens a database workspace scope.)
 
-- `internal/workbench/schema/model.go` `RebuildTree` creates sidebar
-  roots only from schema objects of type `database`; table objects are
-  emitted only under an expanded database root.
-- `ExpandedDatabases` is populated only from `database`-type objects
-  (`initialDatabaseExpansion`), so a lone `{type: "table"}` object is
-  skipped entirely.
-- `database.Open` and the app's `updateOpen` pass `list_schema` results
-  through unchanged — no root synthesis exists.
+## Workspace tabs
 
-With the exact one-object contract the sidebar therefore renders
-`No items.` (PTY-verified) and `keys` cannot be opened from the TUI.
-Queries, the result table, and the query log are unaffected; the browse
-RPC itself is exercised by the integration tests above.
+The plugin advertises the optional `workspace` capability, so the host's
+workspace tab row follows the explicit advertisement instead of the
+legacy per-product policy:
+
+- **Standard tabs** — `standard_tabs: ["columns"]`: the virtual `keys`
+  table keeps the useful **Columns** tab; **Indexes**, **Foreign Keys**,
+  and **Diagram** are omitted (a key-value store has no relations).
+  Query and Browse are host-owned and stay on every tab row regardless.
+- **Custom views** — one driver-owned `server` tab labeled **Server**,
+  visible for **database and table** scopes, served by the new
+  `perk/v1/workspace_view` RPC.
+
+### The Server view
+
+The `server` view answers plain two-column `Field`/`Value` table data
+from native Redis **INFO** sections (`server`, `memory`, `keyspace`), one
+command per section so every supported Redis version answers. Only a
+conservative allowlist of non-secret runtime metrics is taken, field by
+field:
+
+- `server.*` — `redis_version`, `redis_mode`, `arch_bits`,
+  `uptime_in_seconds`, `uptime_in_days`, `tcp_port`;
+- `memory.*` — `used_memory`(+`_human`), `used_memory_rss`,
+  `used_memory_peak`(+`_human`), `maxmemory`(+`_human`),
+  `mem_fragmentation_ratio` (runtime numeric usage/fragmentation only —
+  configuration policy fields such as `maxmemory_policy` are never
+  exposed);
+- `keyspace.*` — `keys`, `expires`, `avg_ttl` of the session's selected
+  logical database only (its `dbN:` line; an empty database reports no
+  keyspace fields).
+
+Rows are sorted by field name, so the table is deterministic. Credentials,
+raw config, the command line, paths, run ids, module fields, and all
+other INFO content never cross the wire, and both rows and cells honor
+the protocol display caps (max 500 rows, 300 runes per cell). The view
+is a session operation like any other: unknown `view_id`s and scopes the
+view does not serve (e.g. `schema` targets) return structured
+`unsupported` errors, and cancellation aborts the collection through the
+request context. No writes, ever.
+
+In the current host the row forms live on the Browse tab; with the
+selectable `keys` table the row forms are reachable from the TUI (open
+`keys` → Browse → edit a row), and the SQL editor (`SET`/`DEL`/`RENAME`)
+remains the direct path. The row-write RPC itself is exercised
+end-to-end by the integration tests; collection **value** editing is
+deliberately unsupported.
 
 ### Connection form
 

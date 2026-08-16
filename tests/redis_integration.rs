@@ -13,10 +13,14 @@ use redis::AsyncCommands;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio_util::sync::CancellationToken;
 
-use perk_redis::dto::request::{BrowseTableRequest, EmptyRequest, StatementRequest, TableRequest};
+use perk_redis::dto::capabilities::WorkspaceViewScope;
+use perk_redis::dto::request::{
+    BrowseTableRequest, EmptyRequest, StatementRequest, TableRequest, WorkspaceViewRequest,
+    WorkspaceViewTarget,
+};
 use perk_redis::dto::service::{BrowseOptions, DatabaseInfo, QueryResult, StatementMetadata};
 use perk_redis::dto::write::{RowValue, RowWriteRequest, RowWriteResponse, Value};
-use perk_redis::protocol::ErrorKind;
+use perk_redis::protocol::{ERR_CANCELED, ERR_INTERNAL, ErrorKind};
 use perk_redis::redis_service::RedisFactory;
 use perk_redis::service::{ServiceError, SessionFactory, SessionService};
 
@@ -202,16 +206,22 @@ async fn open_reports_redis_info_and_selects_the_database() {
 
     exec_ok(&*svc, "FLUSHDB").await;
 
-    // The selected logical database is recorded in the schema name.
+    // The selected logical database is recorded in the schema name,
+    // with a selectable database root above the virtual table.
     let schema = svc
         .list_schema(EmptyRequest {}, CancellationToken::new())
         .await
         .expect("list_schema must succeed");
-    assert_eq!(schema.len(), 1);
-    assert_eq!(schema[0].database, format!("db{}", database_from_url(&url)));
-    assert_eq!(schema[0].type_, "table");
-    assert_eq!(schema[0].name, "keys");
+    let db = format!("db{}", database_from_url(&url));
+    assert_eq!(schema.len(), 2);
+    assert_eq!(schema[0].database, db);
+    assert_eq!(schema[0].type_, "database");
+    assert_eq!(schema[0].name, db);
     assert_eq!(schema[0].row_count, Some(0));
+    assert_eq!(schema[1].database, db);
+    assert_eq!(schema[1].type_, "table");
+    assert_eq!(schema[1].name, "keys");
+    assert_eq!(schema[1].row_count, Some(0));
 
     // A round trip proves the authenticated database is really selected.
     exec_ok(&*svc, "SET selection-probe v").await;
@@ -348,13 +358,13 @@ async fn replies_convert_exactly_for_set_get_arrays_and_maps() {
     let parsed: serde_json::Value = serde_json::from_str(nested).expect("nested cell is JSON");
     assert!(parsed.is_array(), "SCAN value cell must be a JSON array");
 
-    // Long scalar cells: display capped at 300 + ellipsis, full value
-    // preserved in untruncated_rows.
+    // Long scalar cells: display capped at 300 runes in total (the
+    // ellipsis counts), full value preserved in untruncated_rows.
     let long = "x".repeat(400);
     exec_ok(&*svc, &format!("SET conv-long {long}")).await;
     let got = exec_ok(&*svc, "GET conv-long").await;
     let display = got.rows[0][0].as_deref().expect("long cell");
-    assert_eq!(display.chars().count(), 301);
+    assert_eq!(display.chars().count(), 300);
     assert!(display.ends_with('\u{2026}'));
     assert_eq!(got.untruncated_rows[0][0].as_deref(), Some(long.as_str()));
 
@@ -428,11 +438,16 @@ async fn virtual_keys_schema_and_browse_paging() {
         .list_schema(EmptyRequest {}, CancellationToken::new())
         .await
         .expect("list_schema");
-    assert_eq!(schema.len(), 1);
-    assert_eq!(schema[0].database, format!("db{}", database_from_url(&url)));
-    assert_eq!(schema[0].name, "keys");
-    assert_eq!(schema[0].type_, "table");
+    let db = format!("db{}", database_from_url(&url));
+    assert_eq!(schema.len(), 2);
+    assert_eq!(schema[0].database, db);
+    assert_eq!(schema[0].name, db);
+    assert_eq!(schema[0].type_, "database");
     assert_eq!(schema[0].row_count, Some(5));
+    assert_eq!(schema[1].database, db);
+    assert_eq!(schema[1].name, "keys");
+    assert_eq!(schema[1].type_, "table");
+    assert_eq!(schema[1].row_count, Some(5));
 
     let columns = svc
         .table_info(
@@ -1681,4 +1696,266 @@ async fn error_kinds_map_auth_connection_validation_and_unsupported() {
         .await
         .expect_err("closed session must fail");
     assert_eq!(err.kind, ErrorKind::Connection, "{}", err.message);
+}
+
+// --- workspace views ----------------------------------------------------
+
+async fn workspace_view(
+    svc: &dyn SessionService,
+    view_id: &str,
+    target: WorkspaceViewTarget,
+) -> Result<QueryResult, ServiceError> {
+    svc.workspace_view(
+        WorkspaceViewRequest {
+            view_id: view_id.to_string(),
+            target,
+        },
+        CancellationToken::new(),
+    )
+    .await
+}
+
+fn table_target(database: &str) -> WorkspaceViewTarget {
+    WorkspaceViewTarget {
+        kind: WorkspaceViewScope::Table,
+        database: database.to_string(),
+        schema: String::new(),
+        table: "keys".to_string(),
+    }
+}
+
+fn database_target(database: &str) -> WorkspaceViewTarget {
+    WorkspaceViewTarget {
+        kind: WorkspaceViewScope::Database,
+        database: database.to_string(),
+        schema: String::new(),
+        table: String::new(),
+    }
+}
+
+#[tokio::test]
+async fn server_view_reports_allowlisted_metrics_for_table_and_database_targets() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+    exec_ok(&*svc, "SET s:1 v1").await;
+    exec_ok(&*svc, "SET s:2 v2").await;
+    exec_ok(&*svc, "SET s:3 v3").await;
+
+    let db = format!("db{}", database_from_url(&url));
+    for (label, target) in [
+        ("table target", table_target(&db)),
+        ("database target", database_target(&db)),
+    ] {
+        let result = workspace_view(&*svc, "server", target)
+            .await
+            .unwrap_or_else(|e| panic!("server view ({label}) failed: {e:?}"));
+        assert_eq!(
+            result.columns,
+            vec!["Field".to_string(), "Value".to_string()],
+            "columns ({label})"
+        );
+        assert_eq!(result.column_types, vec!["string".to_string(); 2]);
+        assert!(
+            !result.truncated && !result.has_more,
+            "bounded page ({label})"
+        );
+        assert_eq!(result.rows_affected, 0);
+        // A workspace view is not a statement.
+        assert!(result.statement.is_none());
+        assert!(result.statement_metadata.is_none());
+
+        // Sorted deterministic two-column shape: every row has both
+        // cells, fields sort lexicographically, and the allowlisted
+        // field set is exact — no credentials, config, paths, or
+        // module fields.
+        let fields: Vec<(String, String)> = result
+            .rows
+            .iter()
+            .map(|row| {
+                assert_eq!(row.len(), 2, "two cells per row ({label})");
+                (
+                    row[0].clone().expect("field cell"),
+                    row[1].clone().expect("value cell"),
+                )
+            })
+            .collect();
+        assert!(
+            fields.windows(2).all(|w| w[0].0 <= w[1].0),
+            "fields must be sorted ({label}): {fields:?}"
+        );
+        let names: Vec<String> = fields.iter().map(|(f, _)| f.clone()).collect();
+        let want_server = [
+            "server.arch_bits",
+            "server.redis_mode",
+            "server.redis_version",
+            "server.tcp_port",
+            "server.uptime_in_days",
+            "server.uptime_in_seconds",
+        ];
+        let want_memory = [
+            "memory.maxmemory",
+            "memory.maxmemory_human",
+            "memory.mem_fragmentation_ratio",
+            "memory.used_memory",
+            "memory.used_memory_human",
+            "memory.used_memory_peak",
+            "memory.used_memory_peak_human",
+            "memory.used_memory_rss",
+        ];
+        let want_keyspace = ["keyspace.avg_ttl", "keyspace.expires", "keyspace.keys"];
+        let mut want: Vec<String> = want_server
+            .iter()
+            .chain(want_memory.iter())
+            .chain(want_keyspace.iter())
+            .map(|s| s.to_string())
+            .collect();
+        want.sort();
+        assert_eq!(names, want, "exact allowlisted field set ({label})");
+
+        // The server metrics are live native values: the version matches
+        // the open handshake's INFO-derived version, the keyspace counts
+        // the seeded keys of the session's selected database.
+        let value = |field: &str| {
+            fields
+                .iter()
+                .find(|(f, _)| f == field)
+                .unwrap_or_else(|| panic!("missing field {field} ({label})"))
+                .1
+                .clone()
+        };
+        assert_eq!(value("server.redis_version"), info.version, "({label})");
+        assert_eq!(value("keyspace.keys"), "3", "({label})");
+        assert_eq!(value("keyspace.expires"), "0", "({label})");
+        assert!(
+            value("memory.used_memory").parse::<u64>().is_ok(),
+            "used_memory is a byte count ({label})"
+        );
+        assert!(
+            value("memory.used_memory").parse::<u64>().unwrap() >= 3,
+            "used_memory reflects live data ({label})"
+        );
+
+        // No secret or raw-config content can ever ride in a cell.
+        let text = serde_json::to_string(&result).unwrap().to_lowercase();
+        for forbidden in [
+            "config_file",
+            "executable",
+            "commandline",
+            "requirepass",
+            "masterauth",
+            "password",
+            "run_id",
+            "module",
+            "mem_allocator",
+            "maxmemory_policy",
+        ] {
+            assert!(
+                !text.contains(forbidden),
+                "server view must not expose {forbidden:?} ({label})"
+            );
+        }
+    }
+    svc.close();
+}
+
+#[tokio::test]
+async fn server_view_rejects_unknown_views_and_unsupported_scopes() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+    let db = format!("db{}", database_from_url(&url));
+
+    // Unknown view id: unsupported, with the view named in the message.
+    let err = workspace_view(&*svc, "frobnicate", database_target(&db))
+        .await
+        .expect_err("unknown view must be rejected");
+    assert_eq!(err.kind, ErrorKind::Unsupported, "{}", err.message);
+    assert!(err.message.contains("frobnicate"), "{}", err.message);
+    assert_eq!(err.jsonrpc_code(), ERR_INTERNAL);
+
+    // A schema target is not a Redis scope: unsupported.
+    let err = workspace_view(
+        &*svc,
+        "server",
+        WorkspaceViewTarget {
+            kind: WorkspaceViewScope::Schema,
+            database: db,
+            schema: "public".to_string(),
+            table: String::new(),
+        },
+    )
+    .await
+    .expect_err("schema target must be rejected");
+    assert_eq!(err.kind, ErrorKind::Unsupported, "{}", err.message);
+
+    // The session survives both rejections.
+    let pong = exec_ok(&*svc, "PING").await;
+    assert_eq!(pong.rows[0][0].as_deref(), Some("PONG"));
+    svc.close();
+}
+
+#[tokio::test]
+async fn server_view_honors_cancellation_through_the_session_context() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+    exec_ok(&*svc, "SET busy 1").await;
+    let db = format!("db{}", database_from_url(&url));
+
+    // Pause every client for a full second: the workspace_view INFO is
+    // genuinely in flight (held server-side) and cannot complete before
+    // the cancel fires — no dependence on machine speed or the client's
+    // 500 ms response timeout, because the cancel wins far earlier.
+    exec_ok(&*svc, "CLIENT PAUSE 1000 ALL").await;
+
+    let token = CancellationToken::new();
+    let view_future = svc.workspace_view(
+        WorkspaceViewRequest {
+            view_id: "server".to_string(),
+            target: database_target(&db),
+        },
+        token.clone(),
+    );
+    let mut view_future = Box::pin(view_future);
+    let mut cancel_timer = Box::pin(tokio::time::sleep(std::time::Duration::from_millis(250)));
+    let view_result = tokio::select! {
+        r = &mut view_future => {
+            panic!("workspace_view completed while the server was paused: {r:?}")
+        }
+        _ = &mut cancel_timer => {
+            token.cancel();
+            view_future.await
+        }
+    };
+
+    let err = view_result.expect_err("canceled workspace_view must fail");
+    assert_eq!(err.kind, ErrorKind::Cancelled, "{}", err.message);
+    assert_eq!(err.jsonrpc_code(), ERR_CANCELED);
+
+    // The pause expires on its own; the session stays live afterwards.
+    tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
+    let pong = exec_ok(&*svc, "PING").await;
+    assert_eq!(pong.rows[0][0].as_deref(), Some("PONG"));
+    let again = workspace_view(&*svc, "server", database_target(&db))
+        .await
+        .expect("server view works after the pause");
+    assert_eq!(
+        again.rows.len(),
+        17,
+        "6 server + 8 memory + 3 keyspace fields"
+    );
+    svc.close();
 }

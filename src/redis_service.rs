@@ -21,11 +21,11 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::dto::capabilities::FormValues;
+use crate::dto::capabilities::{FormValues, WorkspaceViewScope};
 use crate::dto::request::{
     AddColumnRequest, BrowseTableRequest, BuildTargetResult, ColumnChangeRequest, DropRequest,
     EmptyRequest, ForeignKeyChangeRequest, IndexChangeRequest, ReplaceForeignKeyRequest,
-    ReplaceIndexRequest, StatementRequest, TableRequest,
+    ReplaceIndexRequest, StatementRequest, TableRequest, WorkspaceViewRequest,
 };
 use crate::dto::service::{
     ColumnInfo, DatabaseInfo, ForeignKeyInfo, IndexInfo, QueryResult, ReferencingForeignKeyInfo,
@@ -45,6 +45,41 @@ const PREVIEW_ELEMENTS: i64 = 64;
 
 /// The single fixed virtual table.
 const KEYS_TABLE: &str = "keys";
+
+/// INFO sections the `server` workspace view reads. Each section is
+/// fetched with its own `INFO <section>` command so the view works on
+/// every supported Redis version (multi-section INFO is newer); only
+/// allowlisted fields of these sections ever reach the wire.
+const SERVER_VIEW_SECTIONS: [&str; 3] = ["server", "memory", "keyspace"];
+
+/// The conservative allowlist of INFO server fields exposed by the
+/// `server` workspace view: stable identity and runtime facts only.
+const SERVER_VIEW_SERVER_FIELDS: [&str; 6] = [
+    "redis_version",
+    "redis_mode",
+    "arch_bits",
+    "uptime_in_seconds",
+    "uptime_in_days",
+    "tcp_port",
+];
+
+/// The conservative allowlist of INFO memory fields: runtime numeric
+/// usage and fragmentation metrics only. Configuration policy fields
+/// (e.g. `maxmemory_policy`) are never exposed.
+const SERVER_VIEW_MEMORY_FIELDS: [&str; 8] = [
+    "used_memory",
+    "used_memory_human",
+    "used_memory_rss",
+    "used_memory_peak",
+    "used_memory_peak_human",
+    "maxmemory",
+    "maxmemory_human",
+    "mem_fragmentation_ratio",
+];
+
+/// The keyspace fields reported for the session's selected logical
+/// database (its `dbN:` line), when Redis reports one.
+const SERVER_VIEW_KEYSPACE_FIELDS: [&str; 3] = ["keys", "expires", "avg_ttl"];
 
 /// Commands `execute_read_only` forwards; anything else is rejected
 /// before any Redis I/O. Case-insensitive match on the first token.
@@ -803,11 +838,12 @@ fn to_json(v: &redis::Value) -> serde_json::Value {
     }
 }
 
-/// Caps one display cell at [`MAX_CELL`] Unicode scalar values, appending
-/// an ellipsis (U+2026) when truncated.
+/// Caps one display cell at [`MAX_CELL`] Unicode scalar values in total —
+/// the trailing ellipsis (U+2026) counts toward the cap, so a truncated
+/// cell never exceeds [`MAX_CELL`] runes.
 fn cap_cell(s: &str) -> String {
     if s.chars().count() > MAX_CELL {
-        let mut out: String = s.chars().take(MAX_CELL).collect();
+        let mut out: String = s.chars().take(MAX_CELL - 1).collect();
         out.push('\u{2026}');
         out
     } else {
@@ -1445,6 +1481,118 @@ fn pairs_from_scan(reply: &redis::Value) -> Vec<(String, redis::Value)> {
     out
 }
 
+// --- workspace views ---------------------------------------------------
+
+impl RedisService {
+    /// The `server` workspace view: a deterministic two-column Field/Value
+    /// table of a conservative allowlist of non-secret server/keyspace/
+    /// memory metrics from native INFO sections. Only exact allowlisted
+    /// fields of the three sections are taken — never credentials, raw
+    /// config, the command line, paths, arbitrary module fields, or
+    /// unbounded INFO content — and rows are sorted by field name. The
+    /// keyspace fields report the session's selected logical database only
+    /// (`dbN:` line; an empty database reports no keyspace fields). The
+    /// result follows the bounded table conventions: display cells capped
+    /// at [`MAX_CELL`] runes and rows at [`MAX_ROWS`]. Cancellation aborts
+    /// the collection between sections.
+    async fn server_view(&self, cancel: &CancellationToken) -> Result<QueryResult, ServiceError> {
+        let start = Instant::now();
+        let mut fields: HashMap<String, String> = HashMap::new();
+        for section in SERVER_VIEW_SECTIONS {
+            let mut cmd = redis::cmd("INFO");
+            cmd.arg(section);
+            let reply = tokio::select! {
+                r = self.query::<String>(&cmd) => r,
+                _ = cancel.cancelled() => {
+                    return Err(ServiceError::canceled("request canceled"));
+                }
+            }?;
+            match section {
+                "server" => {
+                    fields.extend(parse_info_section(
+                        &reply,
+                        "server",
+                        &SERVER_VIEW_SERVER_FIELDS,
+                    ));
+                }
+                "memory" => {
+                    fields.extend(parse_info_section(
+                        &reply,
+                        "memory",
+                        &SERVER_VIEW_MEMORY_FIELDS,
+                    ));
+                }
+                "keyspace" => {
+                    fields.extend(parse_keyspace_line(&reply, self.database));
+                }
+                _ => unreachable!("fixed section list"),
+            }
+        }
+        let mut rows: Vec<(String, String)> = fields
+            .into_iter()
+            // Allowlisted values are inherently small, but cap every value
+            // here — not only in the display rows — so both `rows` and
+            // `untruncated_rows` meet the 300-rune cell bound on the wire.
+            .map(|(field, value)| (field, cap_cell(&value)))
+            .collect();
+        rows.sort();
+        Ok(finalize(
+            vec!["Field".to_string(), "Value".to_string()],
+            rows.into_iter()
+                .map(|(field, value)| vec![Some(field), Some(value)])
+                .collect(),
+            start.elapsed(),
+            false,
+            // A workspace view is not a statement: no wire statement or
+            // metadata is attached.
+            None,
+            None,
+        ))
+    }
+}
+
+/// Takes the allowlisted `field: value` lines of one INFO section reply,
+/// prefixed with the section name (`server.redis_version`). Every other
+/// line and field of the section is dropped, so the section's remaining
+/// content (credentials, config, paths, module fields) never crosses
+/// the wire.
+fn parse_info_section(reply: &str, prefix: &str, fields: &[&str]) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    for line in reply.lines() {
+        let Some((field, value)) = line.split_once(':') else {
+            continue;
+        };
+        if fields.contains(&field) {
+            out.insert(format!("{prefix}.{field}"), value.trim().to_string());
+        }
+    }
+    out
+}
+
+/// Takes the allowlisted fields of one logical database's `dbN:` line in
+/// the INFO keyspace section. An absent line (an empty database) yields
+/// no keyspace fields at all.
+fn parse_keyspace_line(reply: &str, database: i64) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let Some(line) = reply
+        .lines()
+        .find(|line| line.starts_with(&format!("db{database}:")))
+    else {
+        return out;
+    };
+    let Some((_, values)) = line.split_once(':') else {
+        return out;
+    };
+    for part in values.split(',') {
+        if let Some((field, value)) = part.split_once('=')
+            && SERVER_VIEW_KEYSPACE_FIELDS.contains(&field)
+        {
+            out.insert(format!("keyspace.{field}"), value.trim().to_string());
+        }
+    }
+    out
+}
+
 impl SessionService for RedisService {
     fn execute(
         &self,
@@ -1540,12 +1688,24 @@ impl SessionService for RedisService {
         let this = self.clone();
         Box::pin(async move {
             let dbsize: i64 = this.query(&redis::cmd("DBSIZE")).await?;
-            Ok(vec![SchemaObject {
-                database: format!("db{}", this.database),
-                type_: "table".to_string(),
-                name: KEYS_TABLE.to_string(),
-                row_count: Some(dbsize.max(0) as u64),
-            }])
+            let database = format!("db{}", this.database);
+            // The database root makes the virtual table reachable in the
+            // host sidebar (roots come only from database-type objects);
+            // the host renders it expanded for non-relational products.
+            Ok(vec![
+                SchemaObject {
+                    database: database.clone(),
+                    type_: "database".to_string(),
+                    name: database.clone(),
+                    row_count: Some(dbsize.max(0) as u64),
+                },
+                SchemaObject {
+                    database,
+                    type_: "table".to_string(),
+                    name: KEYS_TABLE.to_string(),
+                    row_count: Some(dbsize.max(0) as u64),
+                },
+            ])
         })
     }
 
@@ -1705,6 +1865,33 @@ impl SessionService for RedisService {
             let offset = request.options.offset.unwrap_or(0) as usize;
             let limit = request.options.limit.map(|l| l as usize);
             this.run_select(offset, limit).await
+        })
+    }
+
+    fn workspace_view(
+        &self,
+        request: WorkspaceViewRequest,
+        cancel: CancellationToken,
+    ) -> ServiceFuture<'static, QueryResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            if request.view_id != "server" {
+                return Err(ServiceError::unsupported(format!(
+                    "unknown view: {}",
+                    request.view_id
+                )));
+            }
+            // The view is advertised for database and table scopes only;
+            // a schema target is not a Redis scope.
+            match request.target.kind {
+                WorkspaceViewScope::Database | WorkspaceViewScope::Table => {}
+                WorkspaceViewScope::Schema => {
+                    return Err(ServiceError::unsupported(
+                        "view server is not available for schema targets",
+                    ));
+                }
+            }
+            this.server_view(&cancel).await
         })
     }
 
@@ -2148,7 +2335,9 @@ mod tests {
     fn display_cells_are_capped_at_300_with_ellipsis() {
         let long = "x".repeat(400);
         let capped = cap_cell(&long);
-        assert_eq!(capped.chars().count(), 301);
+        // The ellipsis counts toward the 300-rune cap: a truncated cell
+        // is at most MAX_CELL runes, never MAX_CELL + 1.
+        assert_eq!(capped.chars().count(), 300);
         assert!(capped.ends_with('\u{2026}'));
         assert_eq!(cap_cell("short"), "short");
         let exactly = "y".repeat(300);
@@ -3147,5 +3336,137 @@ mod tests {
             assert_eq!(tokens[0], read_command);
             assert_eq!(tokens[1], key);
         }
+    }
+
+    // --- workspace views --------------------------------------------------
+
+    #[test]
+    fn advertised_workspace_keeps_columns_and_omits_relational_tabs() {
+        // The workspace advertisement pins the exact wire shape: the
+        // Columns standard tab only (a key-value store has no indexes,
+        // foreign keys, or diagram) plus the driver-owned `server` view
+        // for database and table scopes.
+        let capabilities = crate::server::redis_capabilities();
+        let workspace = capabilities
+            .workspace
+            .as_ref()
+            .expect("workspace must be advertised");
+        let wire = serde_json::to_value(workspace).unwrap();
+        assert_eq!(
+            wire,
+            serde_json::json!({
+                "standard_tabs": ["columns"],
+                "custom_views": [
+                    {"id": "server", "label": "Server", "scopes": ["database", "table"]}
+                ]
+            }),
+            "workspace advertisement must match the contract exactly"
+        );
+        let text = serde_json::to_string(workspace).unwrap();
+        for forbidden in ["indexes", "foreign_keys", "diagram"] {
+            assert!(
+                !text.contains(forbidden),
+                "advertisement must not contain {forbidden:?}: {text}"
+            );
+        }
+        // The view id/label/scopes satisfy the host's registration
+        // bounds: nonblank, control-free, bounded runes, unique, valid
+        // scopes without duplicates.
+        for view in workspace.custom_views.as_ref().unwrap() {
+            assert!(!view.id.trim().is_empty() && view.id.chars().count() <= 64);
+            assert!(!view.label.trim().is_empty() && view.label.chars().count() <= 32);
+            assert!(!view.id.chars().any(char::is_control));
+            assert!(!view.label.chars().any(char::is_control));
+            assert!(view.scopes.len() <= 3);
+        }
+    }
+
+    #[test]
+    fn parse_info_section_takes_only_allowlisted_fields() {
+        // A hostile INFO server reply: allowlisted fields survive,
+        // everything else — credentials, config, paths, command lines,
+        // module fields — is dropped before it can reach the wire.
+        let reply = "\
+# Server\r
+redis_version:7.4.7\r
+redis_mode:standalone\r
+arch_bits:64\r
+uptime_in_seconds:1234\r
+uptime_in_days:0\r
+tcp_port:6380\r
+config_file:/etc/redis/redis.conf\r
+executable:/usr/local/bin/redis-server\r
+run_id:0123456789abcdef\r
+process_id:42\r
+os:Linux 5.15.0\r
+server_name:secret-host\r
+\r
+# Modules\r
+module:name=mysecretmodule,ver=1\r
+";
+        let fields = parse_info_section(reply, "server", &SERVER_VIEW_SERVER_FIELDS);
+        assert_eq!(
+            fields,
+            std::collections::HashMap::from([
+                ("server.redis_version".to_string(), "7.4.7".to_string()),
+                ("server.redis_mode".to_string(), "standalone".to_string()),
+                ("server.arch_bits".to_string(), "64".to_string()),
+                ("server.uptime_in_seconds".to_string(), "1234".to_string()),
+                ("server.uptime_in_days".to_string(), "0".to_string()),
+                ("server.tcp_port".to_string(), "6380".to_string()),
+            ]),
+            "only allowlisted server fields may survive"
+        );
+        // The memory section keeps runtime metrics and drops policy.
+        let memory = parse_info_section(
+            "\
+used_memory:1048576\r
+used_memory_human:1.00M\r
+maxmemory:0\r
+maxmemory_human:0B\r
+maxmemory_policy:noeviction\r
+mem_fragmentation_ratio:1.05\r
+mem_allocator:jemalloc-5.3.0\r
+",
+            "memory",
+            &SERVER_VIEW_MEMORY_FIELDS,
+        );
+        assert!(
+            !memory.contains_key("memory.maxmemory_policy"),
+            "configuration policy fields must never be exposed"
+        );
+        assert_eq!(memory["memory.mem_fragmentation_ratio"], "1.05");
+        assert!(
+            !memory.contains_key("memory.mem_allocator"),
+            "allocator detail is not on the allowlist"
+        );
+        assert_eq!(memory["memory.maxmemory"], "0");
+    }
+
+    #[test]
+    fn parse_keyspace_line_reports_the_selected_database_only() {
+        let reply = "\
+# Keyspace\r
+db0:keys=1,expires=0,avg_ttl=0\r
+db2:keys=6,expires=2,avg_ttl=12345\r
+db7:keys=99,expires=99,avg_ttl=99999\r
+";
+        let fields = parse_keyspace_line(reply, 2);
+        assert_eq!(
+            fields,
+            std::collections::HashMap::from([
+                ("keyspace.keys".to_string(), "6".to_string()),
+                ("keyspace.expires".to_string(), "2".to_string()),
+                ("keyspace.avg_ttl".to_string(), "12345".to_string()),
+            ]),
+            "only the selected database's line may be reported"
+        );
+        // An empty database has no dbN line: no keyspace fields at all.
+        assert!(
+            parse_keyspace_line(reply, 3).is_empty(),
+            "an absent dbN line must yield no keyspace fields"
+        );
+        // Unknown fields on the line are dropped.
+        assert!(!parse_keyspace_line(reply, 2).contains_key("keyspace.something"));
     }
 }
