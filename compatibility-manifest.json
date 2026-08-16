@@ -8,7 +8,7 @@
     "version": 1
   },
   "host": {
-    "tested_ref": "9a68c1ae26c7a5bf9e0d90caa318c3024ca9d890",
+    "tested_ref": "916c35094a194f10a9f1cac7e6c3eca88bf773ed",
     "policy": "Release compatibility is defined only against tested_ref: the exact l3aro/perk-workbench commit whose conformance evidence a release carries. Any host speaking protocol version 1 is expected to interoperate, but only the pinned ref is release-verified; the latest-host canary workflow tests the host default branch and never defines release compatibility."
   },
   "release_targets": [
