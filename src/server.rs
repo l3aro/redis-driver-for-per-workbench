@@ -600,17 +600,20 @@ fn direct_error(
 
 /// Builds one service error response: the handler's normalized kind
 /// rides in `data` next to the plugin identity and the actual wire
-/// method. The method comes from the dispatch site, so it can never
+/// method, plus the handler's advisory hint/suggested_statement when
+/// attached. The method comes from the dispatch site, so it can never
 /// mismatch the handled RPC.
 fn service_error_response(id: Option<Number>, method: &str, error: &ServiceError) -> Response {
     Response::error(
         id,
-        ErrorObject::with_provenance(
+        ErrorObject::with_guidance(
             error.jsonrpc_code(),
             error.message.clone(),
             error.kind,
             PLUGIN,
             method,
+            &error.hint,
+            &error.suggested_statement,
         ),
     )
 }
@@ -1407,6 +1410,8 @@ mod tests {
                 code: None,
                 message: "boom".to_string(),
                 kind,
+                hint: String::new(),
+                suggested_statement: String::new(),
             };
             let response = service_error_response(
                 Some(serde_json::Number::from(1)),
@@ -1434,6 +1439,27 @@ mod tests {
             r#"{"jsonrpc":"2.0","id":9,"error":{"code":-32603,"message":"empty statement","data":{"kind":"validation","plugin":"redis","method":"perk/v1/execute"}}}"#.to_string()
                 + "\n"
         );
+    }
+
+    #[test]
+    fn service_error_response_serializes_advisory_guidance_separately() {
+        let error = ServiceError::new(
+            "redis: WRONGTYPE Operation against a key holding the wrong kind of value",
+        )
+        .with_guidance(
+            "GET accepts strings, but user:1 is a hash".to_string(),
+            "HGETALL user:1".to_string(),
+        );
+        let response =
+            service_error_response(Some(serde_json::Number::from(9)), "perk/v1/execute", &error);
+        assert_eq!(
+            String::from_utf8(frame_bytes(&response)).expect("frame is UTF-8"),
+            r#"{"jsonrpc":"2.0","id":9,"error":{"code":-32603,"message":"redis: WRONGTYPE Operation against a key holding the wrong kind of value","data":{"kind":"operation","plugin":"redis","method":"perk/v1/execute","hint":"GET accepts strings, but user:1 is a hash","suggested_statement":"HGETALL user:1"}}}"#.to_string()
+                + "\n"
+        );
+        // The guidance never changes the error code, message, or kind.
+        assert_eq!(error.jsonrpc_code(), ERR_INTERNAL);
+        assert_eq!(error.kind, ErrorKind::Operation);
     }
 
     #[test]

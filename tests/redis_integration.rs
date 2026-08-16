@@ -741,6 +741,123 @@ async fn command_errors_do_not_terminate_the_session() {
 }
 
 #[tokio::test]
+async fn wrongtype_errors_carry_advisory_guidance() {
+    let Some(url) = redis_url() else {
+        eprintln!("skipping: REDIS_URL is not set");
+        return;
+    };
+    let _guard = SERIAL.lock().await;
+    let (_info, svc) = open_session(&url).await;
+    exec_ok(&*svc, "FLUSHDB").await;
+
+    // GET on a hash: the required mapping — a hint naming what GET
+    // accepts and what the key actually is, plus HGETALL as the
+    // suggested statement.
+    exec_ok(&*svc, "HSET user:1 name alice").await;
+    let err = exec_async(&*svc, "GET user:1")
+        .await
+        .expect_err("GET on a hash must WRONGTYPE");
+    assert!(
+        err.message.contains("WRONGTYPE"),
+        "message: {}",
+        err.message
+    );
+    assert_eq!(err.hint, "GET accepts strings, but user:1 is a hash");
+    assert_eq!(err.suggested_statement, "HGETALL user:1");
+
+    // Every mapped type suggests its canonical read command.
+    exec_ok(&*svc, "SET str-key v").await;
+    let err = exec_async(&*svc, "LPUSH str-key x")
+        .await
+        .expect_err("LPUSH on a string must WRONGTYPE");
+    assert_eq!(err.hint, "LPUSH accepts lists, but str-key is a string");
+    assert_eq!(err.suggested_statement, "GET str-key");
+
+    exec_ok(&*svc, "RPUSH list-key a b").await;
+    let err = exec_async(&*svc, "GET list-key")
+        .await
+        .expect_err("GET on a list must WRONGTYPE");
+    assert_eq!(err.hint, "GET accepts strings, but list-key is a list");
+    assert_eq!(err.suggested_statement, "LRANGE list-key 0 -1");
+
+    exec_ok(&*svc, "SADD set-key m1 m2").await;
+    let err = exec_async(&*svc, "GET set-key")
+        .await
+        .expect_err("GET on a set must WRONGTYPE");
+    assert_eq!(err.hint, "GET accepts strings, but set-key is a set");
+    assert_eq!(err.suggested_statement, "SMEMBERS set-key");
+
+    exec_ok(&*svc, "ZADD zset-key 1 a 2 b").await;
+    let err = exec_async(&*svc, "GET zset-key")
+        .await
+        .expect_err("GET on a zset must WRONGTYPE");
+    assert_eq!(
+        err.hint,
+        "GET accepts strings, but zset-key is a sorted set"
+    );
+    assert_eq!(err.suggested_statement, "ZRANGE zset-key 0 -1 WITHSCORES");
+
+    // Hostile keys stay valid: the suggestion renders the key through
+    // the same shell quoting the statement parser decodes.
+    exec_ok(&*svc, "HSET 'odd key' f v").await;
+    let err = exec_async(&*svc, "GET 'odd key'")
+        .await
+        .expect_err("GET on a quoted hash key must WRONGTYPE");
+    assert_eq!(err.hint, "GET accepts strings, but odd key is a hash");
+    assert_eq!(err.suggested_statement, "HGETALL 'odd key'");
+
+    // Conservative non-guidance: a single-key command outside the
+    // guidance table WRONGTYPEs but keeps the original failure
+    // untouched, and an unmapped type (stream) does too.
+    exec_ok(&*svc, "HSET bit-key f v").await;
+    let err = exec_async(&*svc, "GETBIT bit-key 0")
+        .await
+        .expect_err("GETBIT on a hash must WRONGTYPE");
+    assert!(
+        err.message.contains("WRONGTYPE"),
+        "message: {}",
+        err.message
+    );
+    assert_eq!(err.hint, "", "GETBIT must not fabricate a hint");
+    assert_eq!(
+        err.suggested_statement, "",
+        "GETBIT must not fabricate a suggestion"
+    );
+
+    exec_ok(&*svc, "XADD stream-key * f v").await;
+    let err = exec_async(&*svc, "GET stream-key")
+        .await
+        .expect_err("GET on a stream must WRONGTYPE");
+    assert!(
+        err.message.contains("WRONGTYPE"),
+        "message: {}",
+        err.message
+    );
+    assert_eq!(err.hint, "", "streams must not fabricate a hint");
+    assert_eq!(
+        err.suggested_statement, "",
+        "streams must not fabricate a suggestion"
+    );
+
+    // The read-only path carries the same guidance.
+    let err = read_only(&*svc, "GET user:1")
+        .await
+        .expect_err("read-only GET on a hash must WRONGTYPE");
+    assert_eq!(err.hint, "GET accepts strings, but user:1 is a hash");
+    assert_eq!(err.suggested_statement, "HGETALL user:1");
+
+    // Non-WRONGTYPE failures never gain guidance.
+    let err = exec_async(&*svc, "GET")
+        .await
+        .expect_err("wrong arity must fail without guidance");
+    assert!(!err.message.contains("WRONGTYPE"));
+    assert_eq!(err.hint, "");
+    assert_eq!(err.suggested_statement, "");
+
+    svc.close();
+}
+
+#[tokio::test]
 async fn browse_collects_all_keys_across_scan_batches() {
     let Some(url) = redis_url() else {
         eprintln!("skipping: REDIS_URL is not set");

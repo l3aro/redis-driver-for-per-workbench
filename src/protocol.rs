@@ -82,16 +82,23 @@ impl<'de> Deserialize<'de> for ErrorKind {
 }
 
 /// Structured error provenance: the stable failure kind, the advisory
-/// plugin identity, and the advisory wire method. The host treats
-/// `plugin` and `method` as advisory only — it overrides them with its
-/// own handshake identity and the actual request method, so the method
-/// renders exactly once. Never carries targets, credentials, statements,
-/// or values.
+/// plugin identity, and the advisory wire method, plus optional
+/// non-control advisory guidance. The host treats `plugin` and `method`
+/// as advisory only — it overrides them with its own handshake identity
+/// and the actual request method, so the method renders exactly once.
+/// `hint` and `suggested_statement` are advisory too: the host renders
+/// them separately from the error and never executes a suggested
+/// statement; empty strings are omitted from the wire. Never carries
+/// targets, credentials, statements, or values beyond the advisory text.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ErrorData {
     pub kind: ErrorKind,
     pub plugin: String,
     pub method: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub hint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub suggested_statement: String,
 }
 
 /// Terminal protocol violations. Either side treats these as fatal: the
@@ -172,13 +179,32 @@ impl ErrorObject {
     }
 
     /// An error with the full structured provenance: stable kind, the
-    /// plugin identity, and the actual wire method, exactly once.
+    /// plugin identity, and the actual wire method, exactly once, and
+    /// no advisory guidance.
     pub fn with_provenance(
         code: i32,
         message: impl Into<String>,
         kind: ErrorKind,
         plugin: &str,
         method: &str,
+    ) -> Self {
+        Self::with_guidance(code, message, kind, plugin, method, "", "")
+    }
+
+    /// An error with the full structured provenance plus optional
+    /// advisory guidance: a `hint` explaining the failure and a
+    /// `suggested_statement` the user may try instead. Both are
+    /// non-control — the host renders them separately and never
+    /// executes a suggestion — and empty strings are omitted from the
+    /// wire.
+    pub fn with_guidance(
+        code: i32,
+        message: impl Into<String>,
+        kind: ErrorKind,
+        plugin: &str,
+        method: &str,
+        hint: &str,
+        suggested_statement: &str,
     ) -> Self {
         ErrorObject {
             code,
@@ -187,6 +213,8 @@ impl ErrorObject {
                 kind,
                 plugin: plugin.to_string(),
                 method: method.to_string(),
+                hint: hint.to_string(),
+                suggested_statement: suggested_statement.to_string(),
             }),
         }
     }
@@ -295,6 +323,44 @@ mod tests {
             serde_json::to_string(&error).unwrap(),
             r#"{"code":-32602,"message":"invalid params: missing statement","data":{"kind":"validation","plugin":"redis","method":"perk/v1/execute"}}"#
         );
+    }
+
+    #[test]
+    fn error_object_with_guidance_emits_advisory_fields_and_omits_empty() {
+        let guided = ErrorObject::with_guidance(
+            ERR_INTERNAL,
+            "redis: WRONGTYPE Operation against a key holding the wrong kind of value",
+            ErrorKind::Operation,
+            "redis",
+            "perk/v1/execute",
+            "GET accepts strings, but user:1 is a hash",
+            "HGETALL user:1",
+        );
+        assert_eq!(
+            serde_json::to_string(&guided).unwrap(),
+            r#"{"code":-32603,"message":"redis: WRONGTYPE Operation against a key holding the wrong kind of value","data":{"kind":"operation","plugin":"redis","method":"perk/v1/execute","hint":"GET accepts strings, but user:1 is a hash","suggested_statement":"HGETALL user:1"}}"#
+        );
+        // Empty advisory strings serialize as absent — never as "" members.
+        let empty = ErrorObject::with_guidance(
+            ERR_INTERNAL,
+            "boom",
+            ErrorKind::Operation,
+            "redis",
+            "perk/v1/execute",
+            "",
+            "",
+        );
+        assert_eq!(
+            serde_json::to_string(&empty).unwrap(),
+            r#"{"code":-32603,"message":"boom","data":{"kind":"operation","plugin":"redis","method":"perk/v1/execute"}}"#,
+            "empty advisories must be omitted from the wire"
+        );
+        // Legacy decode without the new members stays equal to the
+        // no-guidance object.
+        let decoded: ErrorObject =
+            serde_json::from_str(r#"{"code":-32603,"message":"boom","data":{"kind":"operation","plugin":"redis","method":"perk/v1/execute"}}"#)
+                .unwrap();
+        assert_eq!(decoded, empty);
     }
 
     #[test]

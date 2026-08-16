@@ -40,12 +40,19 @@ pub type OpenFuture<'a> = Pin<
 /// (-32603); a present code is used as-is (e.g. -32800 canceled). Every
 /// error carries a normalized [`ErrorKind`], serialized into the
 /// structured `data` provenance of the response (kind + plugin + wire
-/// method); the kind never leaks into the message.
+/// method); the kind never leaks into the message. `hint` and
+/// `suggested_statement` are optional advisory guidance attached with
+/// [`ServiceError::with_guidance`]: non-control, never changing the
+/// kind, code, or message, and serialized into the same `data` object.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServiceError {
     pub code: Option<i32>,
     pub message: String,
     pub kind: ErrorKind,
+    /// Advisory guidance explaining the failure; empty when absent.
+    pub hint: String,
+    /// Advisory statement the user may try instead; empty when absent.
+    pub suggested_statement: String,
 }
 
 impl ServiceError {
@@ -55,6 +62,8 @@ impl ServiceError {
             code: None,
             message: message.into(),
             kind: ErrorKind::Operation,
+            hint: String::new(),
+            suggested_statement: String::new(),
         }
     }
 
@@ -65,6 +74,8 @@ impl ServiceError {
             code: None,
             message: message.into(),
             kind: ErrorKind::Validation,
+            hint: String::new(),
+            suggested_statement: String::new(),
         }
     }
 
@@ -74,6 +85,8 @@ impl ServiceError {
             code: None,
             message: message.into(),
             kind: ErrorKind::Authentication,
+            hint: String::new(),
+            suggested_statement: String::new(),
         }
     }
 
@@ -83,6 +96,8 @@ impl ServiceError {
             code: None,
             message: message.into(),
             kind: ErrorKind::Connection,
+            hint: String::new(),
+            suggested_statement: String::new(),
         }
     }
 
@@ -92,6 +107,8 @@ impl ServiceError {
             code: None,
             message: message.into(),
             kind: ErrorKind::Unsupported,
+            hint: String::new(),
+            suggested_statement: String::new(),
         }
     }
 
@@ -101,6 +118,8 @@ impl ServiceError {
             code: Some(ERR_CANCELED),
             message: message.into(),
             kind: ErrorKind::Cancelled,
+            hint: String::new(),
+            suggested_statement: String::new(),
         }
     }
 
@@ -110,6 +129,8 @@ impl ServiceError {
             code: Some(ERR_INVALID_PARAMS),
             message: message.into(),
             kind: ErrorKind::Validation,
+            hint: String::new(),
+            suggested_statement: String::new(),
         }
     }
 
@@ -119,7 +140,20 @@ impl ServiceError {
             code: Some(ERR_METHOD_NOT_FOUND),
             message: message.into(),
             kind: ErrorKind::Unsupported,
+            hint: String::new(),
+            suggested_statement: String::new(),
         }
+    }
+
+    /// Attaches advisory guidance to a failed operation: a `hint`
+    /// explaining the failure and a `suggested_statement` the user may
+    /// try instead. Non-control — kind, code, and message are
+    /// unchanged, and the host never executes the suggestion. Blank
+    /// values are omitted from the wire.
+    pub fn with_guidance(mut self, hint: String, suggested_statement: String) -> Self {
+        self.hint = hint;
+        self.suggested_statement = suggested_statement;
+        self
     }
 
     pub fn jsonrpc_code(&self) -> i32 {

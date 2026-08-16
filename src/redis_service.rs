@@ -391,6 +391,56 @@ fn map_redis_error(e: &redis::RedisError, prefix: &str) -> ServiceError {
     }
 }
 
+/// Commands whose first argument is a single key, for WRONGTYPE
+/// guidance, mapped to the type family they accept. Conservative by
+/// design: only unambiguous single-key commands are listed, so
+/// multi-key commands (MGET, DEL, EXISTS, ...) and keyless commands
+/// never get guidance; commands that accept any type (TTL, EXPIRE,
+/// TYPE, ...) are absent because they cannot produce WRONGTYPE. The
+/// family names the hint's "accepts" clause; the key's actual type is
+/// inspected separately.
+fn wrongtype_verb(verb: &str) -> Option<&'static str> {
+    match verb {
+        "GET" | "SET" | "SETNX" | "SETEX" | "PSETEX" | "GETSET" | "GETEX" | "GETDEL" | "APPEND"
+        | "STRLEN" | "GETRANGE" | "SETRANGE" | "INCR" | "INCRBY" | "INCRBYFLOAT" | "DECR"
+        | "DECRBY" => Some("strings"),
+        "HSET" | "HSETNX" | "HGET" | "HGETALL" | "HDEL" | "HEXISTS" | "HLEN" | "HKEYS"
+        | "HVALS" | "HMGET" | "HMSET" | "HINCRBY" | "HINCRBYFLOAT" | "HSTRLEN" => Some("hashes"),
+        "LPUSH" | "LPUSHX" | "RPUSH" | "RPUSHX" | "LPOP" | "RPOP" | "LLEN" | "LRANGE"
+        | "LINDEX" | "LSET" | "LREM" | "LTRIM" | "LINSERT" | "LPOS" => Some("lists"),
+        "SADD" | "SREM" | "SMEMBERS" | "SISMEMBER" | "SCARD" | "SPOP" | "SRANDMEMBER"
+        | "SMISMEMBER" => Some("sets"),
+        "ZADD" | "ZREM" | "ZRANGE" | "ZCARD" | "ZSCORE" | "ZRANK" | "ZREVRANK" | "ZINCRBY"
+        | "ZCOUNT" | "ZRANGEBYSCORE" | "ZREVRANGE" => Some("sorted sets"),
+        _ => None,
+    }
+}
+
+/// The single key argument of a listed command: the first token after
+/// the verb, nonblank. Commands outside [`wrongtype_verb`] get no key.
+fn wrongtype_key<'a>(verb: &str, tokens: &'a [String]) -> Option<&'a str> {
+    wrongtype_verb(verb)?;
+    tokens
+        .get(1)
+        .map(String::as_str)
+        .filter(|key| !key.is_empty())
+}
+
+/// The canonical read command for one Redis type, plus the article the
+/// hint uses for what the key actually is. Streams and other types get
+/// no suggestion; the failing command's family (what it accepts) comes
+/// from [`wrongtype_verb`], not from the inspected type.
+fn type_read_command(actual: &str) -> Option<(&'static str, &'static str)> {
+    match actual {
+        "string" => Some(("GET", "a string")),
+        "hash" => Some(("HGETALL", "a hash")),
+        "list" => Some(("LRANGE", "a list")),
+        "set" => Some(("SMEMBERS", "a set")),
+        "zset" => Some(("ZRANGE", "a sorted set")),
+        _ => None,
+    }
+}
+
 // --- row writes ---------------------------------------------------------
 
 /// The atomic update script, shared verbatim by execution and the
@@ -962,6 +1012,70 @@ impl RedisService {
         reply.map(|value| (elapsed, value))
     }
 
+    /// Runs one native command, attaching advisory WRONGTYPE guidance to
+    /// the failure when the command has a determinable key and the key's
+    /// actual type can be inspected. The original failure is never
+    /// replaced or reworded.
+    async fn run_command_guided(
+        &self,
+        tokens: &[String],
+    ) -> Result<(Duration, redis::Value), ServiceError> {
+        match self.run_command(tokens).await {
+            Ok(ok) => Ok(ok),
+            Err(err) => Err(self.attach_wrongtype_guidance(tokens, err).await),
+        }
+    }
+
+    /// Attaches advisory guidance to a WRONGTYPE failure: a hint
+    /// explaining what the command accepts (its family, from the
+    /// failing verb) and what the key actually is, plus a suggested
+    /// read command for the key's type. TYPE is inspected only after a
+    /// WRONGTYPE reply and only for commands with a determinable key;
+    /// any inspection failure or unmapped type keeps the original
+    /// error unchanged. Suggestions are rendered through
+    /// [`render_command`], so arbitrary keys stay valid and
+    /// value-bearing arguments never enter the guidance.
+    async fn attach_wrongtype_guidance(
+        &self,
+        tokens: &[String],
+        err: ServiceError,
+    ) -> ServiceError {
+        if !err.message.contains("WRONGTYPE") {
+            return err;
+        }
+        let Some(verb) = tokens.first() else {
+            return err;
+        };
+        let verb = verb.to_ascii_uppercase();
+        let Some(accepts) = wrongtype_verb(&verb) else {
+            return err;
+        };
+        let Some(key) = wrongtype_key(&verb, tokens) else {
+            return err;
+        };
+        let Some((article, suggested)) = self.wrongtype_guidance(key).await else {
+            return err;
+        };
+        let hint = format!("{verb} accepts {accepts}, but {key} is {article}");
+        err.with_guidance(hint, suggested)
+    }
+
+    /// Inspects one key's actual type after a WRONGTYPE failure and
+    /// maps it onto the canonical read command for that type. Returns
+    /// None — and the caller keeps the original failure — when the
+    /// inspection itself fails or the type has no conservative
+    /// mapping.
+    async fn wrongtype_guidance(&self, key: &str) -> Option<(String, String)> {
+        let actual: String = self.query(redis::cmd("TYPE").arg(key)).await.ok()?;
+        let (read_command, article) = type_read_command(&actual)?;
+        let suggested = match read_command {
+            "LRANGE" => render_command(&[read_command, key, "0", "-1"]),
+            "ZRANGE" => render_command(&[read_command, key, "0", "-1", "WITHSCORES"]),
+            _ => render_command(&[read_command, key]),
+        };
+        Some((article.to_string(), suggested))
+    }
+
     /// Executes a virtual-table SELECT over the fixed `keys` table,
     /// paged exactly like `browse_table`: sorted keys with type and
     /// bounded value previews, `has_more` when the page is not the
@@ -1350,7 +1464,7 @@ impl SessionService for RedisService {
                     // the plugin's own parser.
                     let statement = render_command(&tokens);
                     let metadata = command_metadata(&tokens);
-                    let (duration, reply) = this.run_command(&tokens).await?;
+                    let (duration, reply) = this.run_command_guided(&tokens).await?;
                     let (columns, full_rows) = reply_rows(&reply);
                     let truncated = full_rows.len() > MAX_ROWS;
                     Ok(finalize(
@@ -1392,7 +1506,7 @@ impl SessionService for RedisService {
                     }
                     let statement = render_command(&tokens);
                     let metadata = command_metadata(&tokens);
-                    let (duration, reply) = this.run_command(&tokens).await?;
+                    let (duration, reply) = this.run_command_guided(&tokens).await?;
                     let (columns, full_rows) = reply_rows(&reply);
                     let truncated = full_rows.len() > MAX_ROWS;
                     Ok(finalize(
@@ -2837,5 +2951,100 @@ mod tests {
             map_redis_error(&client, "redis: ").kind,
             ErrorKind::Operation
         );
+    }
+
+    // --- WRONGTYPE advisory guidance --------------------------------------
+
+    #[test]
+    fn wrongtype_verb_maps_families_and_rejects_ambiguous_commands() {
+        assert_eq!(wrongtype_verb("GET"), Some("strings"));
+        assert_eq!(wrongtype_verb("SET"), Some("strings"));
+        assert_eq!(wrongtype_verb("HGETALL"), Some("hashes"));
+        assert_eq!(wrongtype_verb("LRANGE"), Some("lists"));
+        assert_eq!(wrongtype_verb("SMEMBERS"), Some("sets"));
+        assert_eq!(wrongtype_verb("ZRANGE"), Some("sorted sets"));
+        // Multi-key and keyless commands get no guidance.
+        for verb in [
+            "MGET", "DEL", "EXISTS", "MSET", "KEYS", "SCAN", "DBSIZE", "PING", "INFO", "FLUSHDB",
+            "EVAL", "SORT", "BITOP", "TTL", "EXPIRE", "TYPE", "OBJECT",
+        ] {
+            assert_eq!(wrongtype_verb(verb), None, "{verb} must not get guidance");
+        }
+    }
+
+    #[test]
+    fn wrongtype_key_requires_a_listed_command_and_a_blank_key() {
+        let tokens = vec!["get".to_string(), "user:1".to_string()];
+        assert_eq!(wrongtype_key("GET", &tokens), Some("user:1"));
+        // The key argument is the first token after the verb.
+        assert_eq!(
+            wrongtype_key(
+                "LRANGE",
+                &[
+                    "LRANGE".to_string(),
+                    "k".to_string(),
+                    "0".to_string(),
+                    "-1".to_string()
+                ]
+            ),
+            Some("k")
+        );
+        // Missing key, blank key, and unlisted commands yield None.
+        assert_eq!(wrongtype_key("GET", &["GET".to_string()]), None);
+        assert_eq!(
+            wrongtype_key("GET", &["GET".to_string(), "".to_string()]),
+            None
+        );
+        assert_eq!(
+            wrongtype_key("MGET", &["MGET".to_string(), "user:1".to_string()]),
+            None
+        );
+    }
+
+    #[test]
+    fn type_read_command_maps_the_five_types_and_nothing_else() {
+        for (actual, command, article) in [
+            ("string", "GET", "a string"),
+            ("hash", "HGETALL", "a hash"),
+            ("list", "LRANGE", "a list"),
+            ("set", "SMEMBERS", "a set"),
+            ("zset", "ZRANGE", "a sorted set"),
+        ] {
+            let (got_command, got_article) =
+                type_read_command(actual).unwrap_or_else(|| panic!("{actual} must map"));
+            assert_eq!(got_command, command);
+            assert_eq!(got_article, article);
+        }
+        for actual in ["none", "stream", "module", "json"] {
+            assert_eq!(type_read_command(actual), None, "{actual} must not map");
+        }
+    }
+
+    #[test]
+    fn wrongtype_suggestions_render_through_the_command_renderer() {
+        // Full round-trip through the parser: each suggestion must parse
+        // back to exactly the command it describes, and hostile keys
+        // stay valid shell-quoted tokens.
+        for (actual, key, want) in [
+            ("string", "user:1", "GET user:1"),
+            ("hash", "user:1", "HGETALL user:1"),
+            ("list", "user:1", "LRANGE user:1 0 -1"),
+            ("set", "user:1", "SMEMBERS user:1"),
+            ("zset", "user:1", "ZRANGE user:1 0 -1 WITHSCORES"),
+            ("hash", "odd key", "HGETALL 'odd key'"),
+            ("hash", "it's", "HGETALL 'it'\\''s'"),
+        ] {
+            let (read_command, _) = type_read_command(actual).unwrap();
+            let suggested = match read_command {
+                "LRANGE" => render_command(&[read_command, key, "0", "-1"]),
+                "ZRANGE" => render_command(&[read_command, key, "0", "-1", "WITHSCORES"]),
+                _ => render_command(&[read_command, key]),
+            };
+            assert_eq!(suggested, want, "{actual} key {key:?}");
+            // The suggestion round-trips through the plugin's parser.
+            let tokens = shell_words::split(&suggested).expect("suggestion must parse");
+            assert_eq!(tokens[0], read_command);
+            assert_eq!(tokens[1], key);
+        }
     }
 }
