@@ -104,9 +104,13 @@ plugin's stdout carries only protocol frames.
    `Redis 7.4.7`). The schema sidebar renders no items for this plugin
    (see [Schema browsing](#schema-browsing)). The query editor tab is
    labeled **Command** (the plugin advertises `query_language` with
-   name `Redis`, a concrete command placeholder, and example
-   statements) but the initial focus is the schema pane — press `2`
-   (focus workspace) to type into the editor.
+   name `Redis`, a concrete command placeholder, example statements,
+   and a static command catalog) but the initial focus is the schema
+   pane — press `2` (focus workspace) to type into the editor. The
+   catalog powers the editor's completion: press `Ctrl+Space` (insert
+   mode) in the Command tab to see and pick commands like `HGETALL`
+   with their usage and summary; accepting inserts the command name —
+   nothing is executed until you press `F5`.
 
 ## Trying the plugin in the TUI
 

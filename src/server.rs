@@ -25,7 +25,8 @@ use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
 use tokio_util::sync::CancellationToken;
 
 use crate::dto::capabilities::{
-    Capabilities, FormField, FormSpec, QueryLanguage, TargetPattern, WriteCapabilities,
+    Capabilities, FormField, FormSpec, QueryCommand, QueryLanguage, TargetPattern,
+    WriteCapabilities,
 };
 use crate::dto::request::{CancelRequest, CloseRequest, OpenRequest, OpenResult};
 use crate::protocol::{
@@ -63,6 +64,102 @@ const SESSION_METHODS: [&str; 20] = [
     "perk/v1/browse_table",
 ];
 
+/// The static command catalog the query editor completes from. Usage
+/// lines are Redis-native (native commands pass through to the server
+/// verbatim) and deliberately conservative: only forms the plugin's
+/// parser accepts are claimed. SELECT covers both the native database
+/// switch and the virtual-table query syntax; the two share one command
+/// name, so they are one entry.
+fn redis_commands() -> Vec<QueryCommand> {
+    vec![
+        QueryCommand {
+            name: "PING".to_string(),
+            usage: "PING".to_string(),
+            summary: "Check that the connection is alive".to_string(),
+        },
+        QueryCommand {
+            name: "TYPE".to_string(),
+            usage: "TYPE key".to_string(),
+            summary: "Get the type of the value stored at key".to_string(),
+        },
+        QueryCommand {
+            name: "GET".to_string(),
+            usage: "GET key".to_string(),
+            summary: "Get the string value stored at key".to_string(),
+        },
+        QueryCommand {
+            name: "SET".to_string(),
+            usage: "SET key value [NX|XX] [EX seconds|PX milliseconds]".to_string(),
+            summary: "Set the string value at key, optionally with an expiry".to_string(),
+        },
+        QueryCommand {
+            name: "DEL".to_string(),
+            usage: "DEL key [key ...]".to_string(),
+            summary: "Delete one or more keys".to_string(),
+        },
+        QueryCommand {
+            name: "EXISTS".to_string(),
+            usage: "EXISTS key [key ...]".to_string(),
+            summary: "Count how many of the given keys exist".to_string(),
+        },
+        QueryCommand {
+            name: "HGETALL".to_string(),
+            usage: "HGETALL key".to_string(),
+            summary: "Get all fields and values of the hash at key".to_string(),
+        },
+        QueryCommand {
+            name: "HGET".to_string(),
+            usage: "HGET key field".to_string(),
+            summary: "Get the value of one field of the hash at key".to_string(),
+        },
+        QueryCommand {
+            name: "HSET".to_string(),
+            usage: "HSET key field value [field value ...]".to_string(),
+            summary: "Set one or more fields of the hash at key".to_string(),
+        },
+        QueryCommand {
+            name: "LRANGE".to_string(),
+            usage: "LRANGE key start stop".to_string(),
+            summary: "Get a range of elements from the list at key".to_string(),
+        },
+        QueryCommand {
+            name: "LPUSH".to_string(),
+            usage: "LPUSH key element [element ...]".to_string(),
+            summary: "Prepend one or more elements to the list at key".to_string(),
+        },
+        QueryCommand {
+            name: "SMEMBERS".to_string(),
+            usage: "SMEMBERS key".to_string(),
+            summary: "Get all members of the set at key".to_string(),
+        },
+        QueryCommand {
+            name: "SADD".to_string(),
+            usage: "SADD key member [member ...]".to_string(),
+            summary: "Add one or more members to the set at key".to_string(),
+        },
+        QueryCommand {
+            name: "ZRANGE".to_string(),
+            usage: "ZRANGE key start stop [WITHSCORES]".to_string(),
+            summary: "Get a range of members of the sorted set at key".to_string(),
+        },
+        QueryCommand {
+            name: "ZADD".to_string(),
+            usage: "ZADD key score member [score member ...]".to_string(),
+            summary: "Add one or more scored members to the sorted set at key".to_string(),
+        },
+        QueryCommand {
+            name: "SCAN".to_string(),
+            usage: "SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]".to_string(),
+            summary: "Incrementally iterate over the keys in the database".to_string(),
+        },
+        QueryCommand {
+            name: "SELECT".to_string(),
+            usage: "SELECT index | SELECT * FROM \"keys\" [LIMIT n] [OFFSET m]".to_string(),
+            summary: "Select the logical database, or query the virtual keys table".to_string(),
+        },
+    ]
+}
+
 /// The query editor advertisement: Redis commands, no SQL lexer. Every
 /// example below is accepted by the plugin's own parser.
 fn redis_query_language() -> QueryLanguage {
@@ -77,6 +174,7 @@ fn redis_query_language() -> QueryLanguage {
             "SET user:1 v1 NX".to_string(),
             r#"SELECT * FROM "keys" LIMIT 25"#.to_string(),
         ]),
+        commands: Some(redis_commands()),
     }
 }
 
@@ -981,6 +1079,25 @@ mod tests {
                             "GET user:1",
                             "SET user:1 v1 NX",
                             "SELECT * FROM \"keys\" LIMIT 25"
+                        ],
+                        "commands": [
+                            {"name": "PING", "usage": "PING", "summary": "Check that the connection is alive"},
+                            {"name": "TYPE", "usage": "TYPE key", "summary": "Get the type of the value stored at key"},
+                            {"name": "GET", "usage": "GET key", "summary": "Get the string value stored at key"},
+                            {"name": "SET", "usage": "SET key value [NX|XX] [EX seconds|PX milliseconds]", "summary": "Set the string value at key, optionally with an expiry"},
+                            {"name": "DEL", "usage": "DEL key [key ...]", "summary": "Delete one or more keys"},
+                            {"name": "EXISTS", "usage": "EXISTS key [key ...]", "summary": "Count how many of the given keys exist"},
+                            {"name": "HGETALL", "usage": "HGETALL key", "summary": "Get all fields and values of the hash at key"},
+                            {"name": "HGET", "usage": "HGET key field", "summary": "Get the value of one field of the hash at key"},
+                            {"name": "HSET", "usage": "HSET key field value [field value ...]", "summary": "Set one or more fields of the hash at key"},
+                            {"name": "LRANGE", "usage": "LRANGE key start stop", "summary": "Get a range of elements from the list at key"},
+                            {"name": "LPUSH", "usage": "LPUSH key element [element ...]", "summary": "Prepend one or more elements to the list at key"},
+                            {"name": "SMEMBERS", "usage": "SMEMBERS key", "summary": "Get all members of the set at key"},
+                            {"name": "SADD", "usage": "SADD key member [member ...]", "summary": "Add one or more members to the set at key"},
+                            {"name": "ZRANGE", "usage": "ZRANGE key start stop [WITHSCORES]", "summary": "Get a range of members of the sorted set at key"},
+                            {"name": "ZADD", "usage": "ZADD key score member [score member ...]", "summary": "Add one or more scored members to the sorted set at key"},
+                            {"name": "SCAN", "usage": "SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]", "summary": "Incrementally iterate over the keys in the database"},
+                            {"name": "SELECT", "usage": "SELECT index | SELECT * FROM \"keys\" [LIMIT n] [OFFSET m]", "summary": "Select the logical database, or query the virtual keys table"}
                         ]
                     }
                 }

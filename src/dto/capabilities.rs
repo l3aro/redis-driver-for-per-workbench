@@ -64,12 +64,25 @@ pub struct WriteCapabilities {
     pub document: Option<DocumentWriteCapability>,
 }
 
+/// One static command entry of the query language advertisement: the
+/// canonical command name, a Redis-native usage line, and a concise
+/// summary. All three must be nonblank, bounded, and control-free; names
+/// must be unique case-insensitively and the list is capped, so a plugin
+/// can never force an unbounded completion list or handshake frame.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryCommand {
+    pub name: String,
+    pub usage: String,
+    pub summary: String,
+}
+
 /// How the query editor presents this driver's statements: the language
 /// name, the editor tab label, the input placeholder, an optional lexer
-/// hint, and optional example statements the driver's parser already
-/// accepts. `name`, `editor_label`, and `placeholder` must be nonblank;
-/// `lexer` and `examples` are omitted on the wire when absent (Redis
-/// advertises no lexer: statements are commands, not SQL).
+/// hint, optional example statements the driver's parser already
+/// accepts, and an optional static command catalog for completion.
+/// `name`, `editor_label`, and `placeholder` must be nonblank; `lexer`,
+/// `examples`, and `commands` are omitted on the wire when absent
+/// (Redis advertises no lexer: statements are commands, not SQL).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueryLanguage {
     pub name: String,
@@ -79,6 +92,8 @@ pub struct QueryLanguage {
     pub lexer: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub examples: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub commands: Option<Vec<QueryCommand>>,
 }
 
 /// Driver advertisement returned by `perk/v1/initialize`.

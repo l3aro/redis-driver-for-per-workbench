@@ -1840,6 +1840,7 @@ impl SessionFactory for RedisFactory {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dto::capabilities::QueryCommand;
     use crate::dto::write::Value;
     use crate::protocol::ErrorKind;
 
@@ -2877,6 +2878,106 @@ mod tests {
         for example in &examples {
             parse_statement(example)
                 .unwrap_or_else(|e| panic!("advertised example {example:?} must parse: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn advertised_command_catalog_is_valid() {
+        // The static completion catalog the handshake advertises must
+        // cover the required conservative surface, stay within the host
+        // bounds (512 entries; 64/256/256 runes for name/usage/summary),
+        // carry no control characters, and keep names unique
+        // case-insensitively — the host rejects anything else, so this
+        // test pins what the editor will actually see.
+        let capabilities = crate::server::redis_capabilities();
+        let commands = capabilities
+            .query_language
+            .as_ref()
+            .expect("query_language must be advertised")
+            .commands
+            .clone()
+            .expect("commands must be advertised");
+
+        let required = [
+            "PING", "TYPE", "GET", "SET", "DEL", "EXISTS", "HGETALL", "HGET", "HSET", "LRANGE",
+            "LPUSH", "SMEMBERS", "SADD", "ZRANGE", "ZADD", "SCAN", "SELECT",
+        ];
+        let mut by_name: std::collections::HashMap<String, &QueryCommand> =
+            std::collections::HashMap::new();
+        for command in &commands {
+            assert!(
+                !command.name.trim().is_empty(),
+                "command name must be nonblank"
+            );
+            assert!(
+                !command.usage.trim().is_empty(),
+                "usage of {} must be nonblank",
+                command.name
+            );
+            assert!(
+                !command.summary.trim().is_empty(),
+                "summary of {} must be nonblank",
+                command.name
+            );
+            assert!(
+                command.name.chars().count() <= 64,
+                "name {} exceeds the 64-rune bound",
+                command.name
+            );
+            assert!(
+                command.usage.chars().count() <= 256,
+                "usage of {} exceeds the 256-rune bound",
+                command.name
+            );
+            assert!(
+                command.summary.chars().count() <= 256,
+                "summary of {} exceeds the 256-rune bound",
+                command.name
+            );
+            for (label, text) in [
+                ("name", command.name.as_str()),
+                ("usage", command.usage.as_str()),
+                ("summary", command.summary.as_str()),
+            ] {
+                assert!(
+                    !text.chars().any(char::is_control),
+                    "{label} of {} contains a control character",
+                    command.name
+                );
+            }
+            let key = command.name.to_ascii_lowercase();
+            assert!(
+                by_name.insert(key, command).is_none(),
+                "command name {} repeats case-insensitively",
+                command.name
+            );
+        }
+        assert!(
+            commands.len() <= 512,
+            "catalog has {} entries, over the 512 cap",
+            commands.len()
+        );
+
+        for name in required {
+            assert!(
+                by_name.contains_key(&name.to_ascii_lowercase()),
+                "catalog must advertise {name}"
+            );
+        }
+        let select = by_name["select"];
+        assert!(
+            select.usage.contains("SELECT * FROM"),
+            "SELECT usage must cover the virtual-table syntax: {}",
+            select.usage
+        );
+        // The virtual-table form in the usage is the exact grammar the
+        // plugin parses (minus the bracket placeholders).
+        for example in [
+            "SELECT * FROM \"keys\" LIMIT 25",
+            "SELECT * FROM \"keys\" OFFSET 5 LIMIT 10",
+        ] {
+            parse_statement(example)
+                .unwrap_or_else(|e| panic!("catalog SELECT form {example:?} must parse: {e:?}"));
         }
     }
 
