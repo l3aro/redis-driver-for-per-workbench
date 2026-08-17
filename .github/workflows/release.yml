@@ -1,0 +1,81 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout perk-redis
+        uses: actions/checkout@v4
+        with:
+          path: perk-redis
+      - name: Read pinned host ref from compatibility manifest
+        id: manifest
+        working-directory: perk-redis
+        run: |
+          set -euo pipefail
+          ref=$(jq -r '.host.tested_ref' compatibility-manifest.json)
+          echo "$ref" | grep -Eq '^[0-9a-f]{40}$'
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "short_ref=${ref:0:12}" >> "$GITHUB_OUTPUT"
+      - name: Build the release binary
+        working-directory: perk-redis
+        run: cargo build --locked --release
+      - name: Full compatibility check against the pinned host ref (release binary)
+        uses: ./perk-redis/.github/actions/compat-check
+        with:
+          host_ref: ${{ steps.manifest.outputs.ref }}
+          host_version: ${{ steps.manifest.outputs.short_ref }}
+          plugin_binary: target/release/perk-redis
+          evidence_path: ${{ runner.temp }}/plugin-test-evidence.json
+      - name: Release timestamp for reproducible archives
+        id: epoch
+        working-directory: perk-redis
+        run: echo "epoch=$(git log -1 --format=%ct)" >> "$GITHUB_OUTPUT"
+      - name: Package the release
+        id: package
+        working-directory: perk-redis
+        env:
+          TAG: ${{ github.event_name == 'push' && github.ref_name || '' }}
+          EVIDENCE: ${{ runner.temp }}/plugin-test-evidence.json
+          OUT: ${{ runner.temp }}/dist
+          SOURCE_DATE_EPOCH: ${{ steps.epoch.outputs.epoch }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAG" ]; then
+            # workflow_dispatch: dry run with the would-be tag; no
+            # GitHub Release is created.
+            TAG="v$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -n1)"
+            export DRY_RUN=1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          scripts/release-package.sh
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: perk-redis-release-${{ steps.package.outputs.tag }}
+          path: ${{ runner.temp }}/dist
+          if-no-files-found: error
+      - name: Publish GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          manifest="$RUNNER_TEMP/dist/release-manifest.json"
+          tag="${{ github.ref_name }}"
+          notes=$(jq -r '"perk-redis \(.plugin.version) for \(.target)\n\nHost ref: \(.host.ref)\nHost version: \(.host.version)\nProtocol: perk/v\(.protocol.version)\nContract: \(.contract_sha256)\nConformance: \(.conformance.passed)/\(.conformance.passed + .conformance.failed) cases passed"' "$manifest")
+          gh release create "$tag" "$RUNNER_TEMP"/dist/* \
+            --repo "${{ github.repository }}" \
+            --title "perk-redis $tag" \
+            --notes "$notes"

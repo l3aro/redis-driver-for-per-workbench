@@ -263,27 +263,61 @@ nothing listening on `127.0.0.1:6380`.
 
 ## Continuous integration
 
-`.github/workflows/compatibility.yml` runs on every push, pull request,
-and manual `workflow_dispatch`. It checks formatting, clippy, and unit
-tests; builds the plugin with the lockfile; starts and seeds the
-loopback Compose fixture and runs the full integration suite against it;
-then builds the latest `l3aro/perk-workbench` default branch and runs
-its plugin conformance suite (`plugin test --json`, 16 transport cases)
-against the built plugin. The fixture is torn down unconditionally when
-the job ends.
+- `.github/workflows/compatibility.yml` runs on every push, pull
+  request, and manual `workflow_dispatch`. It checks formatting,
+  clippy, and unit tests; builds the plugin with the lockfile; starts
+  and seeds the loopback Compose fixture and runs the full integration
+  suite against it; then checks out the **exact host commit pinned in
+  `compatibility-manifest.json`** (`host.tested_ref`), builds it, and
+  runs its plugin conformance suite (`plugin test --json`, 16
+  transport cases) against the built plugin, validating the evidence
+  document (`ok`, case counts against the manifest, protocol version,
+  contract digest) with jq. This workflow defines **release
+  compatibility**: it always tests the same host commit a release
+  would be evidenced against.
+- `.github/workflows/compatibility-latest-host.yml` is the
+  **latest-host canary**: scheduled weekly and manual, it runs the
+  same check against the host **default branch**. It is a drift
+  alarm only and **never defines release compatibility**.
+- `.github/workflows/release.yml` builds and packages a release: see
+  [Releases](#releases).
 
-The workflow is a **drift canary**: it validates against the current
-default branch of the host rather than a pinned release, so it becomes
-active only once this repository is hosted at its remote and tracks
-whatever the host mainline is today. It intentionally claims no stable
-release compatibility matrix.
+## Releases
+
+A release is a tag `v<version>` matching `Cargo.toml`'s
+`version`. The tag-driven workflow (manual `workflow_dispatch` is a
+dry run that packages without publishing) runs the full pinned-host
+compatibility check against the **release binary**
+(`target/release/perk-redis` — the exact bytes that are archived), then
+packages via `scripts/release-package.sh`:
+
+- `perk-redis-<version>-<target>.tar.gz` — a **reproducible** archive
+  (sorted names, fixed mtime from the release commit's
+  `SOURCE_DATE_EPOCH`, fixed owner/group, gzip `-n`) containing the
+  executable, `README.md`, and `LICENSE` when present;
+- `SHA256SUMS` — archive and evidence hashes;
+- `plugin-test-evidence.json` — the raw conformance evidence from
+  `perk-workbench plugin test --json` against the release binary,
+  whose `executable_sha256` must equal the archived binary's digest;
+- `release-manifest.json` — ties tag/plugin version, target, exact
+  host ref, protocol version, contract digest, executable/archive
+  checksums, and conformance pass/counts, with all jq invariants
+  validated before upload.
+
+CI artifacts are always uploaded; on real `v*` tags a GitHub Release
+is created with `gh` from the validated manifest. Any failed
+invariant aborts the job before publishing — incomplete evidence is
+never released. The only secret used is the built-in `GITHUB_TOKEN`.
 
 ## Layout
 
 | Path | Purpose |
 |---|---|
+| `compatibility-manifest.json` | Machine-readable release-compatibility contract: plugin version source, protocol version, exact tested host ref, supported release targets, required conformance evidence schema |
 | `compose.yaml` | Loopback-only, password-protected Redis fixture |
 | `scripts/seed-demo.sh` | Idempotent seed of logical database 2 |
 | `scripts/run-workbench-demo.sh` | Build + fixture + seed + config + TUI in one command |
+| `scripts/release-package.sh` | Deterministic release packaging with jq-validated invariants |
+| `.github/actions/compat-check/` | Shared fmt/clippy/unit/integration/conformance check |
 | `src/` | perk/v1 transport and the Redis-backed service |
 | `tests/redis_integration.rs` | Integration tests against a live Redis |

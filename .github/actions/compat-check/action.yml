@@ -1,0 +1,129 @@
+name: Full compatibility check
+description: >-
+  Runs the perk-redis quality gates (fmt, clippy, unit tests, and the
+  integration suite against the compose Redis fixture) and the
+  perk-workbench plugin conformance suite (plugin test --json) against
+  the built plugin. host_ref pins the exact l3aro/perk-workbench
+  commit; leave it empty to test the host default branch (canary only
+  — never release compatibility).
+inputs:
+  host_ref:
+    description: >-
+      Exact l3aro/perk-workbench commit to test against. Empty selects
+      the host default branch — canary mode, which never defines
+      release compatibility.
+    required: false
+    default: ""
+  host_version:
+    description: >-
+      Build version injected into the host binary via
+      -ldflags "-X main.version=<value>" so the conformance evidence's
+      host_version names the exact host build. Empty builds the host
+      without injection, which honestly reports "perk-workbench devel".
+    required: false
+    default: ""
+  plugin_binary:
+    description: >-
+      Path of the plugin binary to conformance-test, relative to the
+      perk-redis checkout root.
+    required: false
+    default: target/debug/perk-redis
+  evidence_path:
+    description: >-
+      Absolute path to write the plugin-test evidence JSON to. Empty
+      writes to $RUNNER_TEMP/plugin-test-evidence.json.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Checkout host (pinned ref)
+      if: inputs.host_ref != ''
+      uses: actions/checkout@v4
+      with:
+        repository: l3aro/perk-workbench
+        ref: ${{ inputs.host_ref }}
+        path: source
+    - name: Checkout host (default branch)
+      if: inputs.host_ref == ''
+      uses: actions/checkout@v4
+      with:
+        repository: l3aro/perk-workbench
+        path: source
+    - name: Verify checked-out host ref
+      if: inputs.host_ref != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        got=$(git -C "$GITHUB_WORKSPACE/source" rev-parse HEAD)
+        if [ "$got" != "${{ inputs.host_ref }}" ]; then
+          echo "checked out host $got, want ${{ inputs.host_ref }}" >&2
+          exit 1
+        fi
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.25"
+    - name: Set up Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt, clippy
+    - name: Check formatting
+      working-directory: perk-redis
+      run: cargo fmt --check
+    - name: Clippy with warnings denied
+      working-directory: perk-redis
+      run: cargo clippy --locked --all-targets -- -D warnings
+    - name: Unit tests (no Redis required)
+      working-directory: perk-redis
+      run: cargo test --locked
+    - name: Build plugin
+      working-directory: perk-redis
+      run: cargo build --locked
+    - name: Start Redis fixture
+      working-directory: perk-redis
+      run: docker compose up -d --wait
+    - name: Seed demo data
+      working-directory: perk-redis
+      run: scripts/seed-demo.sh
+    - name: Integration tests against live Redis
+      working-directory: perk-redis
+      env:
+        REDIS_URL: redis://:workbench-demo@127.0.0.1:6380/2
+      run: cargo test --locked --test redis_integration
+    - name: Tear down Redis fixture
+      if: always()
+      working-directory: perk-redis
+      run: docker compose down --volumes --remove-orphans
+    - name: Build workbench host
+      working-directory: source
+      env:
+        HOST_VERSION: ${{ inputs.host_version }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ -n "$HOST_VERSION" ]; then
+          go build -ldflags "-X main.version=$HOST_VERSION" ./cmd/perk-workbench
+        else
+          go build ./cmd/perk-workbench
+        fi
+    - name: Plugin conformance suite against the built plugin
+      working-directory: source
+      env:
+        EVIDENCE_PATH: ${{ inputs.evidence_path }}
+        PLUGIN_BINARY: ${{ inputs.plugin_binary }}
+      shell: bash
+      run: |
+        set -euo pipefail
+        evidence="${EVIDENCE_PATH:-$RUNNER_TEMP/plugin-test-evidence.json}"
+        manifest="$GITHUB_WORKSPACE/perk-redis/compatibility-manifest.json"
+        jq -e '.host.tested_ref | test("^[0-9a-f]{40}$")' "$manifest" >/dev/null
+        cases=$(jq -r '.conformance_evidence.cases' "$manifest")
+        ./perk-workbench plugin test --json "$GITHUB_WORKSPACE/perk-redis/$PLUGIN_BINARY" | tee "$evidence"
+        jq -e --argjson cases "$cases" \
+          '.ok == true and .failed == 0 and (.passed + .failed) == $cases
+           and .protocol_version == 1
+           and (.contract_sha256 | test("^[0-9a-f]{64}$"))
+           and (.host_version | test("^perk-workbench "))' \
+          "$evidence"

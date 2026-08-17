@@ -1,0 +1,23 @@
+name: latest-host canary
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  canary:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout perk-redis
+        uses: actions/checkout@v4
+        with:
+          path: perk-redis
+      - name: Canary check against the host default branch
+        uses: ./perk-redis/.github/actions/compat-check
+        with:
+          host_ref: ""
