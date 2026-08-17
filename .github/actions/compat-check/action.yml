@@ -71,30 +71,38 @@ runs:
         components: rustfmt, clippy
     - name: Check formatting
       working-directory: perk-redis
+      shell: bash
       run: cargo fmt --check
     - name: Clippy with warnings denied
       working-directory: perk-redis
+      shell: bash
       run: cargo clippy --locked --all-targets -- -D warnings
     - name: Unit tests (no Redis required)
       working-directory: perk-redis
+      shell: bash
       run: cargo test --locked
     - name: Build plugin
       working-directory: perk-redis
+      shell: bash
       run: cargo build --locked
     - name: Start Redis fixture
       working-directory: perk-redis
+      shell: bash
       run: docker compose up -d --wait
     - name: Seed demo data
       working-directory: perk-redis
+      shell: bash
       run: scripts/seed-demo.sh
     - name: Integration tests against live Redis
       working-directory: perk-redis
+      shell: bash
       env:
         REDIS_URL: redis://:workbench-demo@127.0.0.1:6380/2
       run: cargo test --locked --test redis_integration
     - name: Tear down Redis fixture
       if: always()
       working-directory: perk-redis
+      shell: bash
       run: docker compose down --volumes --remove-orphans
     - name: Build workbench host
       working-directory: source
